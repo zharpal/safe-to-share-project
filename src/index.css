@@ -1,0 +1,126 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300..900;1,14..32,300..900&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --color-bg: #F5EEDC;
+  --color-blue: #27548A;
+  --color-dark: #183B4E;
+  --color-gold: #DDA853;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-dark);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Scrollbar ─────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--color-blue) 30%, transparent); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--color-blue) 55%, transparent); }
+
+/* ── Skeleton loader ───────────────────────────────────────────────────────── */
+@keyframes skeleton-shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position:  400px 0; }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color-blue) 8%, var(--color-bg)) 25%,
+    color-mix(in srgb, var(--color-blue) 15%, var(--color-bg)) 50%,
+    color-mix(in srgb, var(--color-blue) 8%, var(--color-bg)) 75%
+  );
+  background-size: 800px 100%;
+  animation: skeleton-shimmer 1.6s ease-in-out infinite;
+  border-radius: 6px;
+}
+
+/* ── Number count-up pulse ─────────────────────────────────────────────────── */
+@keyframes value-flash {
+  0%   { opacity: 0.4; transform: scale(0.97); }
+  60%  { opacity: 1;   transform: scale(1.02); }
+  100% { opacity: 1;   transform: scale(1);    }
+}
+.value-updated {
+  animation: value-flash 0.35s ease-out;
+}
+
+/* ── Card entrance ─────────────────────────────────────────────────────────── */
+@keyframes card-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0);     }
+}
+.card-animate {
+  animation: card-in 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.card-animate-d1 { animation-delay: 0.05s; }
+.card-animate-d2 { animation-delay: 0.10s; }
+.card-animate-d3 { animation-delay: 0.15s; }
+.card-animate-d4 { animation-delay: 0.20s; }
+
+/* ── Live pulse dot ────────────────────────────────────────────────────────── */
+@keyframes live-ping {
+  0%, 100% { transform: scale(1);   opacity: 1;   }
+  50%       { transform: scale(1.5); opacity: 0.5; }
+}
+.live-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: #10b981;
+  animation: live-ping 1.4s ease-in-out infinite;
+  display: inline-block;
+}
+
+/* ── Positive / negative color helpers ────────────────────────────────────── */
+.text-bull { color: #059669; }
+.text-bear { color: #dc2626; }
+.text-flat { color: #6b7280; }
+
+/* ── Smooth tab transition ─────────────────────────────────────────────────── */
+.tab-panel-enter {
+  animation: card-in 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* ── Focus ring ────────────────────────────────────────────────────────────── */
+*:focus-visible {
+  outline: 2px solid var(--color-blue);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ── Table row hover ───────────────────────────────────────────────────────── */
+tbody tr {
+  transition: background-color 0.12s ease;
+}
+
+/* ── Header gradient bar ───────────────────────────────────────────────────── */
+.header-gradient {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--color-bg) 92%, var(--color-blue)) 0%,
+    color-mix(in srgb, var(--color-bg) 97%, var(--color-gold)) 100%
+  );
+}
+
+/* ── Glow badges ───────────────────────────────────────────────────────────── */
+.badge-bull {
+  background: color-mix(in srgb, #059669 12%, white);
+  border: 1px solid color-mix(in srgb, #059669 25%, white);
+  color: #065f46;
+}
+.badge-bear {
+  background: color-mix(in srgb, #dc2626 10%, white);
+  border: 1px solid color-mix(in srgb, #dc2626 20%, white);
+  color: #991b1b;
+}
+.badge-flat {
+  background: color-mix(in srgb, #6b7280 10%, white);
+  border: 1px solid color-mix(in srgb, #6b7280 20%, white);
+  color: #374151;
+}
