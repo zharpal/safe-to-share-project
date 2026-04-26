@@ -86,6 +86,8 @@ export default function App() {
   const [adminLoginStatus, setAdminLoginStatus] = useState<"idle" | "saving" | "error">("idle");
   const [accessToken, setAccessToken] = useState("");
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "success" | "error">("idle");
+  const [autoLoginStatus, setAutoLoginStatus] = useState<"idle" | "saving" | "success" | "error">("idle");
+  const [autoLoginMessage, setAutoLoginMessage] = useState<string | null>(null);
   const [oauthRedirectUri, setOauthRedirectUri] = useState("");
   const [uriCopied, setUriCopied] = useState(false);
   const [exportStatus, setExportStatus] = useState<{
@@ -271,6 +273,22 @@ export default function App() {
     await fetch("/api/auth/logout", { method: "POST" });
     setIsAuthenticated(false);
     setSaveStatus("idle");
+  };
+
+  const handleAutoLogin = async () => {
+    setAutoLoginStatus("saving");
+    setAutoLoginMessage(null);
+    try {
+      const res = await fetch("/api/auth/upstox/auto-login", { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || "Upstox auto-login failed");
+      setAutoLoginStatus("success");
+      setAutoLoginMessage(data?.message || "Upstox auto-login succeeded.");
+      refreshAuthStatus();
+    } catch (error: any) {
+      setAutoLoginStatus("error");
+      setAutoLoginMessage(error?.message || "Upstox auto-login failed");
+    }
   };
 
   const handleExportNow = async () => {
@@ -598,6 +616,37 @@ export default function App() {
                       The active Upstox token is stored server-side for background capture and export jobs.
                       Get your token from <span className="font-bold text-blue">Upstox Developer Console</span>.
                     </p>
+                  </div>
+
+                  <div className="rounded-xl border border-blue/10 bg-white/60 p-4 space-y-3">
+                    <div>
+                      <p className="text-xs font-bold text-blue uppercase tracking-wider">Automatic Upstox Login</p>
+                      <p className="text-[11px] text-dark/60 mt-1">
+                        Uses the Railway environment variables to log in server-side and store a fresh token.
+                      </p>
+                    </div>
+                    {autoLoginMessage && (
+                      <div className={`flex items-center gap-2 text-sm rounded-lg px-4 py-2 border ${
+                        autoLoginStatus === "success"
+                          ? "text-emerald-600 bg-emerald-50 border-emerald-200"
+                          : autoLoginStatus === "error"
+                          ? "text-rose-600 bg-rose-50 border-rose-200"
+                          : "text-blue bg-blue-50 border-blue/20"
+                      }`}>
+                        {autoLoginStatus === "success" ? <CheckCircle size={14} /> : autoLoginStatus === "error" ? <XCircle size={14} /> : <Loader2 size={14} className="animate-spin" />}
+                        <span>{autoLoginMessage}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-end">
+                      <button
+                        onClick={handleAutoLogin}
+                        disabled={autoLoginStatus === "saving"}
+                        className="px-4 py-2 rounded-lg text-sm font-bold bg-[#522D8F] text-white hover:bg-[#3f226e] transition-colors shadow-md disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                      >
+                        {autoLoginStatus === "saving" && <Loader2 size={14} className="animate-spin" />}
+                        {autoLoginStatus === "saving" ? "Running…" : "Run Upstox Auto-Login"}
+                      </button>
+                    </div>
                   </div>
 
                   {saveStatus === "error" && (
