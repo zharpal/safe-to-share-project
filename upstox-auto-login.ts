@@ -172,8 +172,25 @@ export async function upstoxAutoLogin(
     // Upstox commonly uses either a single 6-digit input or six single-digit
     // boxes. We try the single-input path first; if the combined value ends
     // up wrong we fall through to the multi-input path.
-    const otpSingle = page.locator('input[name="otp"], input[name="otpNum"], input[inputmode="numeric"][maxlength="6"]').first();
-    const otpMulti = page.locator('input[name^="otp"], input[data-testid^="otp-"]');
+    const otpSingle = page
+      .locator(
+        [
+          'input[name="otp"]',
+          'input[name="otpNum"]',
+          'input[autocomplete="one-time-code"]',
+          'input[inputmode="numeric"][maxlength="6"]',
+          'input[type="tel"][maxlength="6"]',
+        ].join(", ")
+      )
+      .first();
+    const otpMulti = page.locator(
+      [
+        'input[name^="otp"]',
+        'input[data-testid^="otp-"]',
+        'input[inputmode="numeric"][maxlength="1"]',
+        'input[type="tel"][maxlength="1"]',
+      ].join(", ")
+    );
 
     let otpSingleVisible = false;
     try {
@@ -201,8 +218,24 @@ export async function upstoxAutoLogin(
 
     // ── Step 3: PIN ─────────────────────────────────────────────────────────
     console.log("[upstox-auto-login] entering PIN…");
-    const pinSingle = page.locator('input[name="pin"], input[name="pinNum"], input[type="password"]').first();
-    const pinMulti = page.locator('input[name^="pin"]');
+    const pinSingle = page
+      .locator(
+        [
+          'input[name="pin"]',
+          'input[name="pinNum"]',
+          'input[type="password"]',
+          'input[inputmode="numeric"][maxlength="6"]',
+          'input[type="tel"][maxlength="6"]',
+        ].join(", ")
+      )
+      .first();
+    const pinMulti = page.locator(
+      [
+        'input[name^="pin"]',
+        'input[inputmode="numeric"][maxlength="1"]',
+        'input[type="tel"][maxlength="1"]',
+      ].join(", ")
+    );
 
     let pinSingleVisible = false;
     try {
