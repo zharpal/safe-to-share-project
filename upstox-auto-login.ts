@@ -223,15 +223,19 @@ export async function upstoxAutoLogin(
         [
           'input[name="pin"]',
           'input[name="pinNum"]',
+          'input[placeholder*="PIN" i]',
+          'input[aria-label*="PIN" i]',
           'input[type="password"]',
           'input[inputmode="numeric"][maxlength="6"]',
           'input[type="tel"][maxlength="6"]',
         ].join(", ")
       )
       .first();
-    const pinMulti = page.locator(
+    let pinMulti = page.locator(
       [
         'input[name^="pin"]',
+        'input[placeholder*="PIN" i][maxlength="1"]',
+        'input[aria-label*="PIN" i][maxlength="1"]',
         'input[inputmode="numeric"][maxlength="1"]',
         'input[type="tel"][maxlength="1"]',
       ].join(", ")
@@ -246,7 +250,19 @@ export async function upstoxAutoLogin(
     if (pinSingleVisible) {
       await pinSingle.fill(loginPin);
     } else {
-      const count = await pinMulti.count();
+      let count = await pinMulti.count();
+      if (count === 0) {
+        // Some Upstox variants reuse generic numeric boxes with no pin-specific
+        // attributes. At this stage we're already past TOTP, so it's safe to
+        // fall back to any visible 1-digit numeric inputs.
+        pinMulti = page.locator(
+          [
+            'input[inputmode="numeric"]:not([type="hidden"])',
+            'input[type="tel"]:not([type="hidden"])',
+          ].join(", ")
+        );
+        count = await pinMulti.count();
+      }
       if (count === 0) {
         throw new Error("PIN input field not found on Upstox login page");
       }
