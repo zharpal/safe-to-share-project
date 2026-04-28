@@ -5,12 +5,13 @@ import { StrikeTimeline } from "./components/StrikeTimeline";
 import { WsTimeline } from "./components/WsTimeline";
 import { OptionChain } from "./components/OptionChain";
 import { IndicesCharts } from "./components/IndicesCharts";
-import { Settings, Activity, BarChart2, List, LogIn, CheckCircle, XCircle, Loader2, Zap, Copy, Check, LineChart, Brain, TrendingUp, CloudUpload, History, Download, Radio, AlertTriangle } from "lucide-react";
+import { Settings, Activity, BarChart2, List, LogIn, CheckCircle, XCircle, Loader2, Zap, Copy, Check, LineChart, Brain, TrendingUp, CloudUpload, History, Download, Radio, AlertTriangle, BellRing } from "lucide-react";
 import { SmartMoneyAI } from "./components/SmartMoneyAI";
 import { SensexTimeline } from "./components/SensexTimeline";
 import { DeepSeekChat } from "./components/DeepSeekChat";
 import { FlowIntelligence } from "./components/FlowIntelligence";
 import { ExportCenter } from "./components/ExportCenter";
+import { AlertCenter } from "./components/AlertCenter";
 
 // ── NSE Holidays (keep in sync with server.ts NSE_HOLIDAYS) ────────────────
 const NSE_HOLIDAYS = new Set([
@@ -51,7 +52,7 @@ function getMarketStatus(): { open: boolean; label: string; minutesLeft: number 
 
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"timeline" | "live" | "sensex" | "charts" | "eod" | "chain" | "ai" | "flow" | "export">("timeline");
+  const [activeTab, setActiveTab] = useState<"timeline" | "live" | "sensex" | "charts" | "eod" | "chain" | "ai" | "flow" | "alerts" | "export">("timeline");
   const [marketStatus, setMarketStatus] = useState(getMarketStatus);
   const marketTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [captureStale, setCaptureStale] = useState(false);
@@ -86,8 +87,6 @@ export default function App() {
   const [adminLoginStatus, setAdminLoginStatus] = useState<"idle" | "saving" | "error">("idle");
   const [accessToken, setAccessToken] = useState("");
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "success" | "error">("idle");
-  const [autoLoginStatus, setAutoLoginStatus] = useState<"idle" | "saving" | "success" | "error">("idle");
-  const [autoLoginMessage, setAutoLoginMessage] = useState<string | null>(null);
   const [oauthRedirectUri, setOauthRedirectUri] = useState("");
   const [uriCopied, setUriCopied] = useState(false);
   const [exportStatus, setExportStatus] = useState<{
@@ -275,22 +274,6 @@ export default function App() {
     setSaveStatus("idle");
   };
 
-  const handleAutoLogin = async () => {
-    setAutoLoginStatus("saving");
-    setAutoLoginMessage(null);
-    try {
-      const res = await fetch("/api/auth/upstox/auto-login", { method: "POST" });
-      const data = await res.json().catch(() => null);
-      if (!res.ok) throw new Error(data?.error || "Upstox auto-login failed");
-      setAutoLoginStatus("success");
-      setAutoLoginMessage(data?.message || "Upstox auto-login succeeded.");
-      refreshAuthStatus();
-    } catch (error: any) {
-      setAutoLoginStatus("error");
-      setAutoLoginMessage(error?.message || "Upstox auto-login failed");
-    }
-  };
-
   const handleExportNow = async () => {
     await fetch("/api/export/run", { method: "POST" });
     refreshExportStatus();
@@ -367,6 +350,7 @@ export default function App() {
               { id: "eod",      icon: BarChart2,    label: "EOD Data",  color: "blue"   },
               { id: "ai",       icon: Brain,        label: "Smart AI",  color: "violet" },
               { id: "flow",     icon: Zap,          label: "Flow Intel",color: "amber"  },
+              { id: "alerts",   icon: BellRing,     label: "Alerts",    color: "rose"   },
               { id: "export",   icon: Download,     label: "Export",    color: "blue"   },
             ] as const).map(({ id, icon: Icon, label, color }) => {
               const active = activeTab === id;
@@ -375,6 +359,7 @@ export default function App() {
                 orange: "bg-white text-orange-600 border-orange-200 shadow-sm",
                 violet: "bg-white text-violet-600 border-violet-200 shadow-sm",
                 amber:  "bg-white text-amber-600 border-amber-200 shadow-sm",
+                rose:   "bg-white text-rose-600 border-rose-200 shadow-sm",
               };
               return (
                 <button
@@ -484,6 +469,7 @@ export default function App() {
         <div className={activeTab === "chain"    ? "tab-panel-enter" : "hidden"}><OptionChain /></div>
         <div className={activeTab === "ai"       ? "tab-panel-enter" : "hidden"}><SmartMoneyAI /></div>
         <div className={activeTab === "flow"     ? "tab-panel-enter" : "hidden"}><FlowIntelligence /></div>
+        <div className={activeTab === "alerts"   ? "tab-panel-enter" : "hidden"}><AlertCenter /></div>
         <div className={activeTab === "export"   ? "tab-panel-enter" : "hidden"}><ExportCenter /></div>
       </main>
 
@@ -616,37 +602,6 @@ export default function App() {
                       The active Upstox token is stored server-side for background capture and export jobs.
                       Get your token from <span className="font-bold text-blue">Upstox Developer Console</span>.
                     </p>
-                  </div>
-
-                  <div className="rounded-xl border border-blue/10 bg-white/60 p-4 space-y-3">
-                    <div>
-                      <p className="text-xs font-bold text-blue uppercase tracking-wider">Automatic Upstox Login</p>
-                      <p className="text-[11px] text-dark/60 mt-1">
-                        Uses the Railway environment variables to log in server-side and store a fresh token.
-                      </p>
-                    </div>
-                    {autoLoginMessage && (
-                      <div className={`flex items-center gap-2 text-sm rounded-lg px-4 py-2 border ${
-                        autoLoginStatus === "success"
-                          ? "text-emerald-600 bg-emerald-50 border-emerald-200"
-                          : autoLoginStatus === "error"
-                          ? "text-rose-600 bg-rose-50 border-rose-200"
-                          : "text-blue bg-blue-50 border-blue/20"
-                      }`}>
-                        {autoLoginStatus === "success" ? <CheckCircle size={14} /> : autoLoginStatus === "error" ? <XCircle size={14} /> : <Loader2 size={14} className="animate-spin" />}
-                        <span>{autoLoginMessage}</span>
-                      </div>
-                    )}
-                    <div className="flex justify-end">
-                      <button
-                        onClick={handleAutoLogin}
-                        disabled={autoLoginStatus === "saving"}
-                        className="px-4 py-2 rounded-lg text-sm font-bold bg-[#522D8F] text-white hover:bg-[#3f226e] transition-colors shadow-md disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-                      >
-                        {autoLoginStatus === "saving" && <Loader2 size={14} className="animate-spin" />}
-                        {autoLoginStatus === "saving" ? "Running…" : "Run Upstox Auto-Login"}
-                      </button>
-                    </div>
                   </div>
 
                   {saveStatus === "error" && (
