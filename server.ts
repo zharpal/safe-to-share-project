@@ -27,6 +27,12 @@ const LOT_SIZE = 65;        // Nifty 50 lot size (Tuesday weekly expiry)
 const SENSEX_LOT_SIZE = 20; // BSE Sensex lot size
 const MAX_HISTORY_DAYS = 7;
 const MAX_HISTORY_MS = MAX_HISTORY_DAYS * 24 * 60 * 60 * 1000;
+
+// Flow alert thresholds. Override from Railway env vars if needed.
+const FLOW_ALERT_MIN_COI = parseInt(process.env.FLOW_ALERT_MIN_COI || "100000", 10);
+const FLOW_ALERT_MIN_SPOT_MOVE = parseFloat(process.env.FLOW_ALERT_MIN_SPOT_MOVE || "5");
+const FLOW_ALERT_DEDUPE_MS = parseInt(process.env.FLOW_ALERT_DEDUPE_MS || String(5 * 60 * 1000), 10);
+const FLOW_ALERT_MAX_STRIKE_DISTANCE = parseInt(process.env.FLOW_ALERT_MAX_STRIKE_DISTANCE || "250", 10);
 const SERVER_SECRETS_FILE = path.join(process.cwd(), "data", "server-secrets.json");
 const APP_SECRETS_TABLE = "app_secrets";
 const ADMIN_SESSION_COOKIE = "admin_session";
@@ -470,6 +476,328 @@ async function appendLiveHistory(strike: number, point: any): Promise<any[]> {
   return pruned;
 }
 
+
+// Automated CE/PE Flow Alerts
+type FlowAlertDirection = "BULLISH" | "BEARISH" | "NEUTRAL";
+type FlowAlertSeverity = "INFO" | "WATCH" | "HIGH" | "CRITICAL";
+
+type StoredFlowAlert = {
+  id: string;
+  createdAt: string;
+  isoTimestamp: string;
+  timestamp: string;
+  strike: number;
+  timeframe: "1m" | "3m";
+  type: string;
+  direction: FlowAlertDirection;
+  severity: FlowAlertSeverity;
+  score: number;
+  spot: number;
+  title: string;
+  message: string;
+  metrics: Record<string, any>;
+  acknowledged: boolean;
+};
+
+const alertMemory: StoredFlowAlert[] = [];
+const recentAlertKeys = new Map<string, number>();
+let flowAlertsTableReady = false;
+
+function num(v: any): number {
+  if (v == null) return 0;
+  const n = typeof v === "number" ? v : parseFloat(String(v).replace(/,/g, ""));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function fmtN(v: number): string {
+  return Math.round(v).toLocaleString("en-IN");
+}
+
+function fmtP(v: number): string {
+  return `${v > 0 ? "+" : ""}${v.toFixed(2)}`;
+}
+
+function clampScore(v: number): number {
+  return Math.max(1, Math.min(100, Math.round(v)));
+}
+
+function severityFromScore(score: number): FlowAlertSeverity {
+  if (score >= 88) return "CRITICAL";
+  if (score >= 72) return "HIGH";
+  if (score >= 55) return "WATCH";
+  return "INFO";
+}
+
+async function ensureFlowAlertsTable(): Promise<void> {
+  if (!pgPool || flowAlertsTableReady) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS flow_alerts (
+      id            TEXT PRIMARY KEY,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      iso_ts        TEXT NOT NULL,
+      strike        INTEGER NOT NULL,
+      timeframe     TEXT NOT NULL,
+      alert_type    TEXT NOT NULL,
+      direction     TEXT NOT NULL,
+      severity      TEXT NOT NULL,
+      score         INTEGER NOT NULL,
+      spot          NUMERIC,
+      title         TEXT NOT NULL,
+      message       TEXT NOT NULL,
+      metrics       JSONB NOT NULL DEFAULT '{}'::jsonb,
+      acknowledged  BOOLEAN NOT NULL DEFAULT FALSE
+    )
+  `);
+  await pgPool.query(`CREATE INDEX IF NOT EXISTS flow_alerts_created_at_idx ON flow_alerts (created_at DESC)`);
+  flowAlertsTableReady = true;
+}
+
+async function persistFlowAlert(alert: StoredFlowAlert): Promise<void> {
+  alertMemory.unshift(alert);
+  if (alertMemory.length > 200) alertMemory.splice(200);
+
+  const pool = pgPool;
+  if (!pool) return;
+  await ensureFlowAlertsTable();
+  await pool.query(
+    `INSERT INTO flow_alerts
+      (id, created_at, iso_ts, strike, timeframe, alert_type, direction, severity, score, spot, title, message, metrics, acknowledged)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)
+     ON CONFLICT (id) DO NOTHING`,
+    [
+      alert.id,
+      alert.createdAt,
+      alert.isoTimestamp,
+      alert.strike,
+      alert.timeframe,
+      alert.type,
+      alert.direction,
+      alert.severity,
+      alert.score,
+      alert.spot,
+      alert.title,
+      alert.message,
+      JSON.stringify(alert.metrics || {}),
+      alert.acknowledged,
+    ]
+  );
+}
+
+async function getRecentFlowAlerts(limit = 50): Promise<StoredFlowAlert[]> {
+  const safeLimit = Math.max(1, Math.min(limit, 200));
+  const pool = pgPool;
+  if (!pool) return alertMemory.slice(0, safeLimit);
+  await ensureFlowAlertsTable();
+  const { rows } = await pool.query(
+    `SELECT id, created_at, iso_ts, strike, timeframe, alert_type, direction, severity, score, spot, title, message, metrics, acknowledged
+     FROM flow_alerts
+     ORDER BY created_at DESC
+     LIMIT $1`,
+    [safeLimit]
+  );
+  return rows.map((r: any) => ({
+    id: r.id,
+    createdAt: new Date(r.created_at).toISOString(),
+    isoTimestamp: r.iso_ts,
+    timestamp: new Date(r.iso_ts).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" }),
+    strike: Number(r.strike),
+    timeframe: r.timeframe,
+    type: r.alert_type,
+    direction: r.direction,
+    severity: r.severity,
+    score: Number(r.score),
+    spot: Number(r.spot || 0),
+    title: r.title,
+    message: r.message,
+    metrics: r.metrics || {},
+    acknowledged: !!r.acknowledged,
+  }));
+}
+
+async function acknowledgeFlowAlert(id: string): Promise<boolean> {
+  if (!id) return false;
+  const pool = pgPool;
+  if (pool) {
+    await ensureFlowAlertsTable();
+    const result = await pool.query(`UPDATE flow_alerts SET acknowledged = TRUE WHERE id = $1`, [id]);
+    return (result.rowCount || 0) > 0;
+  }
+  const alert = alertMemory.find(a => a.id === id);
+  if (!alert) return false;
+  alert.acknowledged = true;
+  return true;
+}
+
+function buildFlowAlert(input: Omit<StoredFlowAlert, "id" | "createdAt" | "severity" | "acknowledged">): StoredFlowAlert {
+  const score = clampScore(input.score);
+  return {
+    ...input,
+    id: crypto.createHash("sha1").update(`${input.isoTimestamp}:${input.strike}:${input.type}:${input.direction}`).digest("hex").slice(0, 16),
+    createdAt: new Date().toISOString(),
+    score,
+    severity: severityFromScore(score),
+    acknowledged: false,
+  };
+}
+
+async function pushFlowAlert(alert: StoredFlowAlert): Promise<void> {
+  const key = `${alert.type}:${alert.direction}:${alert.strike}`;
+  const last = recentAlertKeys.get(key) || 0;
+  if (Date.now() - last < FLOW_ALERT_DEDUPE_MS) return;
+  recentAlertKeys.set(key, Date.now());
+  await persistFlowAlert(alert);
+  console.log(`[flow-alert] ${alert.severity} ${alert.direction} ${alert.strike}: ${alert.title}`);
+}
+
+async function evaluateAndStoreFlowAlerts(strike: number, curr: any, prev: any): Promise<void> {
+  if (!curr || !prev) return;
+
+  const spot = num(curr.spot);
+  const prevSpot = num(prev.spot);
+  const spotChg = spot - prevSpot;
+  const absSpotChg = Math.abs(spotChg);
+  const dist = strike - spot;
+  if (!spot || Math.abs(dist) > FLOW_ALERT_MAX_STRIKE_DISTANCE) return;
+
+  const callCOI = num(curr.call?.coi);
+  const putCOI = num(curr.put?.coi);
+  const callOI = num(curr.call?.oi);
+  const putOI = num(curr.put?.oi);
+  const callPrem = num(curr.call?.premiumRoc);
+  const putPrem = num(curr.put?.premiumRoc);
+  const callIvRoc = num(curr.call?.ivRoc);
+  const putIvRoc = num(curr.put?.ivRoc);
+  const callOiRatio = putOI > 0 ? callOI / putOI : 0;
+  const putOiRatio = callOI > 0 ? putOI / callOI : 0;
+
+  const baseMetrics = {
+    spot,
+    prevSpot,
+    spotChg: Number(spotChg.toFixed(2)),
+    distanceFromSpot: Number(dist.toFixed(2)),
+    callCOI,
+    putCOI,
+    callOI,
+    putOI,
+    callPremiumRoc: callPrem,
+    putPremiumRoc: putPrem,
+    callIvRoc,
+    putIvRoc,
+    callOiRatio: Number(callOiRatio.toFixed(2)),
+    putOiRatio: Number(putOiRatio.toFixed(2)),
+  };
+
+  const nearResistance = dist >= -25 && dist <= 125;
+  const nearSupport = dist <= 25 && dist >= -125;
+  const alerts: StoredFlowAlert[] = [];
+
+  if (strike < spot && spotChg >= FLOW_ALERT_MIN_SPOT_MOVE && callPrem > 0 && callPrem <= spotChg * 0.60 && callCOI <= -FLOW_ALERT_MIN_COI) {
+    const premiumEfficiency = callPrem / Math.max(spotChg, 0.01);
+    const score = 55 + Math.min(25, Math.abs(callCOI) / FLOW_ALERT_MIN_COI * 5) + Math.min(20, (0.60 - premiumEfficiency) * 60);
+    alerts.push(buildFlowAlert({
+      isoTimestamp: curr.isoTimestamp,
+      timestamp: curr.timestamp,
+      strike,
+      timeframe: "1m",
+      type: "ITM_CE_EXHAUSTION",
+      direction: "BEARISH",
+      score,
+      spot,
+      title: `ITM CE premium underperformance at ${strike}`,
+      message: `Spot rose ${fmtP(spotChg)}, but ${strike} CE premium rose only ${fmtP(callPrem)} while CE OI reduced by ${fmtN(Math.abs(callCOI))}. This looks like call short-covering/exhaustion, not strong fresh buying.`,
+      metrics: { ...baseMetrics, premiumEfficiency: Number(premiumEfficiency.toFixed(2)) },
+    }));
+  }
+
+  if (nearResistance && callCOI >= FLOW_ALERT_MIN_COI && callOiRatio >= 1.35 && callPrem <= Math.max(0.75, Math.max(spotChg, 0) * 0.30)) {
+    const score = 58 + Math.min(22, callCOI / FLOW_ALERT_MIN_COI * 4) + Math.min(20, callOiRatio * 5);
+    alerts.push(buildFlowAlert({
+      isoTimestamp: curr.isoTimestamp,
+      timestamp: curr.timestamp,
+      strike,
+      timeframe: "1m",
+      type: "CALL_WRITING_RESISTANCE",
+      direction: "BEARISH",
+      score,
+      spot,
+      title: `Call wall / absorption near ${strike}`,
+      message: `${strike} CE added ${fmtN(callCOI)} OI, but CE premium changed only ${fmtP(callPrem)}. CE OI is ${callOiRatio.toFixed(2)}x PE OI, so resistance may be building near this strike.`,
+      metrics: baseMetrics,
+    }));
+  }
+
+  if (spotChg <= -FLOW_ALERT_MIN_SPOT_MOVE && ((callCOI >= FLOW_ALERT_MIN_COI && callPrem < 0) || (putCOI >= FLOW_ALERT_MIN_COI && putPrem > 0))) {
+    const score = 65 + Math.min(20, (Math.max(callCOI, 0) + Math.max(putCOI, 0)) / FLOW_ALERT_MIN_COI * 3) + Math.min(15, absSpotChg);
+    alerts.push(buildFlowAlert({
+      isoTimestamp: curr.isoTimestamp,
+      timestamp: curr.timestamp,
+      strike,
+      timeframe: "1m",
+      type: "BEARISH_CONFIRMATION",
+      direction: "BEARISH",
+      score,
+      spot,
+      title: `Bearish flow confirmation at ${strike}`,
+      message: `Spot fell ${fmtP(spotChg)}. CE premium ${fmtP(callPrem)} with CE COI ${fmtN(callCOI)}, and PE premium ${fmtP(putPrem)} with PE COI ${fmtN(putCOI)}. Reversal/fall is getting confirmation.`,
+      metrics: baseMetrics,
+    }));
+  }
+
+  if (strike > spot && spotChg <= -FLOW_ALERT_MIN_SPOT_MOVE && putPrem > 0 && putPrem <= absSpotChg * 0.60 && putCOI <= -FLOW_ALERT_MIN_COI) {
+    const premiumEfficiency = putPrem / Math.max(absSpotChg, 0.01);
+    const score = 55 + Math.min(25, Math.abs(putCOI) / FLOW_ALERT_MIN_COI * 5) + Math.min(20, (0.60 - premiumEfficiency) * 60);
+    alerts.push(buildFlowAlert({
+      isoTimestamp: curr.isoTimestamp,
+      timestamp: curr.timestamp,
+      strike,
+      timeframe: "1m",
+      type: "ITM_PE_EXHAUSTION",
+      direction: "BULLISH",
+      score,
+      spot,
+      title: `ITM PE premium underperformance at ${strike}`,
+      message: `Spot fell ${fmtP(spotChg)}, but ${strike} PE premium rose only ${fmtP(putPrem)} while PE OI reduced by ${fmtN(Math.abs(putCOI))}. Downside may be exhausting.`,
+      metrics: { ...baseMetrics, premiumEfficiency: Number(premiumEfficiency.toFixed(2)) },
+    }));
+  }
+
+  if (nearSupport && putCOI >= FLOW_ALERT_MIN_COI && putOiRatio >= 1.35 && putPrem <= Math.max(0.75, Math.max(-spotChg, 0) * 0.30)) {
+    const score = 58 + Math.min(22, putCOI / FLOW_ALERT_MIN_COI * 4) + Math.min(20, putOiRatio * 5);
+    alerts.push(buildFlowAlert({
+      isoTimestamp: curr.isoTimestamp,
+      timestamp: curr.timestamp,
+      strike,
+      timeframe: "1m",
+      type: "PUT_WRITING_SUPPORT",
+      direction: "BULLISH",
+      score,
+      spot,
+      title: `Put wall / support near ${strike}`,
+      message: `${strike} PE added ${fmtN(putCOI)} OI, but PE premium changed only ${fmtP(putPrem)}. PE OI is ${putOiRatio.toFixed(2)}x CE OI, so support may be building near this strike.`,
+      metrics: baseMetrics,
+    }));
+  }
+
+  if (spotChg >= FLOW_ALERT_MIN_SPOT_MOVE && ((putCOI >= FLOW_ALERT_MIN_COI && putPrem < 0) || (callCOI >= FLOW_ALERT_MIN_COI && callPrem > 0))) {
+    const score = 65 + Math.min(20, (Math.max(callCOI, 0) + Math.max(putCOI, 0)) / FLOW_ALERT_MIN_COI * 3) + Math.min(15, absSpotChg);
+    alerts.push(buildFlowAlert({
+      isoTimestamp: curr.isoTimestamp,
+      timestamp: curr.timestamp,
+      strike,
+      timeframe: "1m",
+      type: "BULLISH_CONFIRMATION",
+      direction: "BULLISH",
+      score,
+      spot,
+      title: `Bullish flow confirmation at ${strike}`,
+      message: `Spot rose ${fmtP(spotChg)}. CE premium ${fmtP(callPrem)} with CE COI ${fmtN(callCOI)}, and PE premium ${fmtP(putPrem)} with PE COI ${fmtN(putCOI)}. Upside/reversal is getting confirmation.`,
+      metrics: baseMetrics,
+    }));
+  }
+
+  for (const alert of alerts) await pushFlowAlert(alert);
+}
+
 // ── Shared bar-building utilities ────────────────────────────────────────────
 
 // True when prev bar is from a different IST calendar day — forces COI = 0
@@ -592,6 +920,8 @@ async function captureAllStrikes(): Promise<void> {
       const prevLive = getLiveHistory(strike)[0];
       const livePoint = buildPoint(sd, prevLive);
       await appendLiveHistory(strike, livePoint);
+      evaluateAndStoreFlowAlerts(strike, livePoint, prevLive)
+        .catch((e: Error) => console.error("[flow-alert] evaluation failed:", e.message));
     }
 
     lastCaptureSuccessAt = Date.now();
@@ -1956,6 +2286,34 @@ async function startServer() {
       lastError:         lastCaptureError,
       lastErrorAt:       lastCaptureErrorAt,
     });
+  });
+
+
+  app.get("/api/flow-alerts", async (req, res) => {
+    try {
+      const limit = parseInt(String(req.query.limit || "50"), 10);
+      const alerts = await getRecentFlowAlerts(Number.isFinite(limit) ? limit : 50);
+      res.json({
+        ok: true,
+        minCoi: FLOW_ALERT_MIN_COI,
+        minSpotMove: FLOW_ALERT_MIN_SPOT_MOVE,
+        maxStrikeDistance: FLOW_ALERT_MAX_STRIKE_DISTANCE,
+        alerts,
+      });
+    } catch (e: any) {
+      console.error("[flow-alert] list failed:", e.message);
+      res.status(500).json({ ok: false, error: e.message || "failed to load alerts" });
+    }
+  });
+
+  app.post("/api/flow-alerts/:id/ack", async (req, res) => {
+    try {
+      const ok = await acknowledgeFlowAlert(req.params.id);
+      res.json({ ok });
+    } catch (e: any) {
+      console.error("[flow-alert] ack failed:", e.message);
+      res.status(500).json({ ok: false, error: e.message || "failed to acknowledge alert" });
+    }
   });
 
   app.get("/api/admin/status", (req, res) => {
