@@ -5,13 +5,14 @@ import { StrikeTimeline } from "./components/StrikeTimeline";
 import { WsTimeline } from "./components/WsTimeline";
 import { OptionChain } from "./components/OptionChain";
 import { IndicesCharts } from "./components/IndicesCharts";
-import { Settings, Activity, BarChart2, List, LogIn, CheckCircle, XCircle, Loader2, Zap, Copy, Check, LineChart, Brain, TrendingUp, CloudUpload, History, Download, Radio, AlertTriangle, BellRing } from "lucide-react";
+import { Settings, Activity, BarChart2, List, LogIn, CheckCircle, XCircle, Loader2, Zap, Copy, Check, LineChart, Brain, TrendingUp, CloudUpload, History, Download, Radio, AlertTriangle, BellRing, TestTube2 } from "lucide-react";
 import { SmartMoneyAI } from "./components/SmartMoneyAI";
 import { SensexTimeline } from "./components/SensexTimeline";
 import { DeepSeekChat } from "./components/DeepSeekChat";
 import { FlowIntelligence } from "./components/FlowIntelligence";
 import { ExportCenter } from "./components/ExportCenter";
 import { AlertCenter } from "./components/AlertCenter";
+import { BacktestCenter } from "./components/BacktestCenter";
 
 // ── NSE Holidays (keep in sync with server.ts NSE_HOLIDAYS) ────────────────
 const NSE_HOLIDAYS = new Set([
@@ -52,7 +53,7 @@ function getMarketStatus(): { open: boolean; label: string; minutesLeft: number 
 
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"timeline" | "live" | "sensex" | "charts" | "eod" | "chain" | "ai" | "flow" | "alerts" | "export">("timeline");
+  const [activeTab, setActiveTab] = useState<"timeline" | "live" | "sensex" | "charts" | "eod" | "chain" | "ai" | "flow" | "alerts" | "backtest" | "export">("timeline");
   const [marketStatus, setMarketStatus] = useState(getMarketStatus);
   const marketTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [captureStale, setCaptureStale] = useState(false);
@@ -351,6 +352,7 @@ export default function App() {
               { id: "ai",       icon: Brain,        label: "Smart AI",  color: "violet" },
               { id: "flow",     icon: Zap,          label: "Flow Intel",color: "amber"  },
               { id: "alerts",   icon: BellRing,     label: "Alerts",    color: "rose"   },
+              { id: "backtest", icon: TestTube2,    label: "Backtest",  color: "indigo" },
               { id: "export",   icon: Download,     label: "Export",    color: "blue"   },
             ] as const).map(({ id, icon: Icon, label, color }) => {
               const active = activeTab === id;
@@ -470,6 +472,7 @@ export default function App() {
         <div className={activeTab === "ai"       ? "tab-panel-enter" : "hidden"}><SmartMoneyAI /></div>
         <div className={activeTab === "flow"     ? "tab-panel-enter" : "hidden"}><FlowIntelligence /></div>
         <div className={activeTab === "alerts"   ? "tab-panel-enter" : "hidden"}><AlertCenter /></div>
+        <div className={activeTab === "backtest" ? "tab-panel-enter" : "hidden"}><BacktestCenter /></div>
         <div className={activeTab === "export"   ? "tab-panel-enter" : "hidden"}><ExportCenter /></div>
       </main>
 

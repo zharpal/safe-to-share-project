@@ -9,6 +9,7 @@ interface FlowAlert {
   createdAt: string;
   isoTimestamp: string;
   timestamp: string;
+  underlying: string;
   strike: number;
   timeframe: "1m" | "3m";
   type: string;
@@ -37,6 +38,15 @@ interface AlertResponse {
   minCoi: number;
   minSpotMove: number;
   maxStrikeDistance: number;
+  volumeLookback?: number;
+  minVolZscore?: number;
+  minVolRatio?: number;
+  trapWaitMs?: number;
+  highVolumeDedupeMs?: number;
+  scanAllStrikes?: boolean;
+  niftyMinVolume?: number;
+  sensexMinVolume?: number;
+  atmRangeSteps?: number;
   alerts: FlowAlert[];
 }
 
@@ -99,7 +109,7 @@ function playAlertBeep() {
 
 export function AlertCenter() {
   const [alerts, setAlerts] = useState<FlowAlert[]>([]);
-  const [config, setConfig] = useState<{ minCoi: number; minSpotMove: number; maxStrikeDistance: number } | null>(null);
+  const [config, setConfig] = useState<{ minCoi: number; minSpotMove: number; maxStrikeDistance: number; volumeLookback?: number; minVolZscore?: number; minVolRatio?: number; trapWaitMs?: number; highVolumeDedupeMs?: number; scanAllStrikes?: boolean; niftyMinVolume?: number; sensexMinVolume?: number; atmRangeSteps?: number } | null>(null);
   const [directionFilter, setDirectionFilter] = useState<"ALL" | Direction>("ALL");
   const [loading, setLoading] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -118,6 +128,15 @@ export function AlertCenter() {
         minCoi: data.minCoi,
         minSpotMove: data.minSpotMove,
         maxStrikeDistance: data.maxStrikeDistance,
+        volumeLookback: data.volumeLookback,
+        minVolZscore: data.minVolZscore,
+        minVolRatio: data.minVolRatio,
+        trapWaitMs: data.trapWaitMs,
+        highVolumeDedupeMs: data.highVolumeDedupeMs,
+        scanAllStrikes: data.scanAllStrikes,
+        niftyMinVolume: data.niftyMinVolume,
+        sensexMinVolume: data.sensexMinVolume,
+        atmRangeSteps: data.atmRangeSteps,
       });
       setLastUpdated(new Date());
     } catch (error) {
@@ -205,13 +224,13 @@ export function AlertCenter() {
             <div>
               <h2 className="text-3xl font-bold text-dark tracking-tighter uppercase">Flow Alerts</h2>
               <p className="text-sm text-blue font-bold mt-1 tracking-widest uppercase">
-                Automated CE/PE reversal, absorption, and confirmation alerts.
+                Immediate SD200 high-volume event, 5-minute trap validation, and CE/PE BUY alerts.
               </p>
             </div>
           </div>
           <p className="text-xs text-dark/40 font-mono mt-2">
             {config
-              ? `Rules: min COI ${inrNum(config.minCoi)} · min spot move ${config.minSpotMove} pts · ATM/near strikes within ${config.maxStrikeDistance} pts`
+              ? `Rules: instant SD${config.volumeLookback || 200} volume info · Z >= ${config.minVolZscore || 2.5} or Vol/SD >= ${config.minVolRatio || 6} · ${config.scanAllStrikes ? "all strikes" : `ATM +/- ${config.atmRangeSteps ?? 1}`} · wait ${Math.round((config.trapWaitMs || 300000) / 60000)} min for BUY confirmation`
               : "Loading alert rules..."}
           </p>
         </div>
@@ -262,6 +281,7 @@ export function AlertCenter() {
                   {latestCritical.severity}
                 </span>
                 <span className="text-xs font-black uppercase tracking-wider">{latestCritical.direction}</span>
+                <span className="text-xs font-black uppercase tracking-wider">{latestCritical.underlying} {latestCritical.strike}</span>
                 <span className="text-xs font-mono opacity-70">{formatDateTime(latestCritical.isoTimestamp)}</span>
               </div>
               <h3 className="mt-1 text-lg font-black">{latestCritical.title}</h3>
@@ -329,6 +349,9 @@ export function AlertCenter() {
                   <span className={`px-2 py-0.5 rounded-lg border text-[10px] font-black uppercase tracking-wider ${colorForDirection(alert.direction)}`}>
                     {alert.direction}
                   </span>
+                  <span className="px-2 py-0.5 rounded-lg bg-blue/10 text-blue text-[10px] font-black uppercase tracking-wider">
+                    {alert.underlying} {alert.strike}
+                  </span>
                   <span className="text-xs font-mono text-dark/50">{formatDateTime(alert.isoTimestamp)}</span>
                   <span className="text-xs font-mono text-dark/50">{alert.timeframe}</span>
                   {alert.acknowledged && (
@@ -368,12 +391,24 @@ export function AlertCenter() {
                     <p className="font-mono font-bold text-dark">{signed(alert.metrics.putPremiumRoc)}</p>
                   </div>
                   <div className="rounded-xl bg-slate-50 border border-slate-100 px-2 py-1.5">
+                    <p className="text-dark/40 font-bold uppercase">Side</p>
+                    <p className="font-mono font-bold text-dark">{alert.metrics.triggerSide || "-"}</p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 border border-slate-100 px-2 py-1.5">
                     <p className="text-dark/40 font-bold uppercase">Score</p>
                     <p className="font-mono font-bold text-dark">{alert.score}/100</p>
                   </div>
                   <div className="rounded-xl bg-slate-50 border border-slate-100 px-2 py-1.5">
                     <p className="text-dark/40 font-bold uppercase">Type</p>
                     <p className="font-mono font-bold text-dark truncate" title={alert.type}>{alert.type}</p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 border border-slate-100 px-2 py-1.5">
+                    <p className="text-dark/40 font-bold uppercase">CE Vol Z</p>
+                    <p className="font-mono font-bold text-dark">{signed(alert.metrics.callVolZ)}</p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 border border-slate-100 px-2 py-1.5">
+                    <p className="text-dark/40 font-bold uppercase">PE Vol Z</p>
+                    <p className="font-mono font-bold text-dark">{signed(alert.metrics.putVolZ)}</p>
                   </div>
                 </div>
               </div>

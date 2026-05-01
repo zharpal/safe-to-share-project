@@ -33,6 +33,26 @@ const FLOW_ALERT_MIN_COI = parseInt(process.env.FLOW_ALERT_MIN_COI || "100000", 
 const FLOW_ALERT_MIN_SPOT_MOVE = parseFloat(process.env.FLOW_ALERT_MIN_SPOT_MOVE || "5");
 const FLOW_ALERT_DEDUPE_MS = parseInt(process.env.FLOW_ALERT_DEDUPE_MS || String(5 * 60 * 1000), 10);
 const FLOW_ALERT_MAX_STRIKE_DISTANCE = parseInt(process.env.FLOW_ALERT_MAX_STRIKE_DISTANCE || "250", 10);
+
+// Trap-alert thresholds based on the attached SD200 / option buying flow logic.
+// SD200 volume is only an ATTENTION trigger; CE/PE direction is confirmed after a wait window.
+const FLOW_ALERT_VOLUME_LOOKBACK = parseInt(process.env.FLOW_ALERT_VOLUME_LOOKBACK || "200", 10);
+const FLOW_ALERT_MIN_VOLUME_SAMPLES = parseInt(process.env.FLOW_ALERT_MIN_VOLUME_SAMPLES || "80", 10);
+const FLOW_ALERT_MIN_VOL_ZSCORE = parseFloat(process.env.FLOW_ALERT_MIN_VOL_ZSCORE || "2.50");
+const FLOW_ALERT_MIN_VOL_RATIO = parseFloat(process.env.FLOW_ALERT_MIN_VOL_RATIO || "6.00");
+const FLOW_ALERT_MIN_VOLUME = parseInt(process.env.FLOW_ALERT_MIN_VOLUME || "1000000", 10);
+const FLOW_ALERT_MIN_VOLUME_NIFTY = parseInt(process.env.FLOW_ALERT_MIN_VOLUME_NIFTY || String(FLOW_ALERT_MIN_VOLUME), 10);
+const FLOW_ALERT_MIN_VOLUME_SENSEX = parseInt(process.env.FLOW_ALERT_MIN_VOLUME_SENSEX || "150000", 10);
+const FLOW_ALERT_MIN_VOLUME_BANKNIFTY = parseInt(process.env.FLOW_ALERT_MIN_VOLUME_BANKNIFTY || "50000", 10);
+const FLOW_ALERT_HIGH_VOLUME_DEDUPE_MS = parseInt(process.env.FLOW_ALERT_HIGH_VOLUME_DEDUPE_MS || String(60 * 1000), 10);
+const FLOW_ALERT_SCAN_ALL_STRIKES = (process.env.FLOW_ALERT_SCAN_ALL_STRIKES || "true").toLowerCase() !== "false";
+const FLOW_ALERT_TRAP_WAIT_MS = parseInt(process.env.FLOW_ALERT_TRAP_WAIT_MS || String(5 * 60 * 1000), 10);
+const FLOW_ALERT_BREAK_BUFFER = parseFloat(process.env.FLOW_ALERT_BREAK_BUFFER || "2");
+const FLOW_ALERT_PREMIUM_BIAS_MIN = parseFloat(process.env.FLOW_ALERT_PREMIUM_BIAS_MIN || "4");
+const FLOW_ALERT_ATM_RANGE_STEPS = parseInt(process.env.FLOW_ALERT_ATM_RANGE_STEPS || "1", 10);
+const FLOW_ALERT_NIFTY_STEP = parseInt(process.env.FLOW_ALERT_NIFTY_STEP || "50", 10);
+const FLOW_ALERT_SENSEX_STEP = parseInt(process.env.FLOW_ALERT_SENSEX_STEP || "100", 10);
+const FLOW_ALERT_BANKNIFTY_STEP = parseInt(process.env.FLOW_ALERT_BANKNIFTY_STEP || "100", 10);
 const SERVER_SECRETS_FILE = path.join(process.cwd(), "data", "server-secrets.json");
 const APP_SECRETS_TABLE = "app_secrets";
 const ADMIN_SESSION_COOKIE = "admin_session";
@@ -416,7 +436,7 @@ function isMarketOpen(): boolean {
 
 // ── Live (1-min) bar storage ──────────────────────────────────────────────────
 const liveStore = new Map<number, any[]>();
-const LIVE_MAX_MS = 24 * 60 * 60 * 1000;
+const LIVE_MAX_MS = MAX_HISTORY_MS; // keep enough history for SD200 volume calculations
 
 if (pgPool) {
   pgPool.query(`
@@ -477,6 +497,76 @@ async function appendLiveHistory(strike: number, point: any): Promise<any[]> {
 }
 
 
+// Alert-specific live store, keyed by underlying + strike. This prevents NIFTY/SENSEX
+// collisions and lets the SD200 high-volume trigger scan every option strike.
+const flowLiveStore = new Map<string, any[]>();
+
+function normUnderlying(value: string): string {
+  return String(value || "NIFTY").trim().toUpperCase();
+}
+
+function flowHistoryKey(underlying: string, strike: number): string {
+  return `${normUnderlying(underlying)}|${strike}`;
+}
+
+if (pgPool) {
+  pgPool.query(`
+    CREATE TABLE IF NOT EXISTS flow_live_bars (
+      underlying TEXT    NOT NULL,
+      strike     INTEGER NOT NULL,
+      iso_ts     TEXT    NOT NULL,
+      bar_data   JSONB   NOT NULL,
+      PRIMARY KEY (underlying, strike, iso_ts)
+    )
+  `).catch((e: Error) => console.error("[flow-live] table init:", e.message));
+}
+
+async function getFlowAlertHistoryAsync(underlying: string, strike: number): Promise<any[]> {
+  const key = flowHistoryKey(underlying, strike);
+  if (!flowLiveStore.has(key)) {
+    let rows: any[] = [];
+    if (pgPool) {
+      try {
+        const cutoff = new Date(Date.now() - LIVE_MAX_MS).toISOString();
+        const { rows: dbRows } = await pgPool.query(
+          `SELECT bar_data FROM flow_live_bars WHERE underlying=$1 AND strike=$2 AND iso_ts>=$3 ORDER BY iso_ts DESC`,
+          [normUnderlying(underlying), strike, cutoff]
+        );
+        rows = dbRows.map((r: any) => r.bar_data);
+      } catch (e: any) { console.error("[flow-live] load:", e.message); }
+    }
+    flowLiveStore.set(key, pruneLive(rows));
+  }
+  return flowLiveStore.get(key)!;
+}
+
+function getFlowAlertHistory(underlying: string, strike: number): any[] {
+  return flowLiveStore.get(flowHistoryKey(underlying, strike)) || [];
+}
+
+async function appendFlowAlertHistory(underlying: string, strike: number, point: any): Promise<any[]> {
+  const normalized = normUnderlying(underlying);
+  const key = flowHistoryKey(normalized, strike);
+  const history = await getFlowAlertHistoryAsync(normalized, strike);
+  if (history.length > 0 && history[0].isoTimestamp) {
+    const lastMs = new Date(history[0].isoTimestamp).getTime();
+    const nowMs  = new Date(point.isoTimestamp).getTime();
+    if (Math.abs(nowMs - lastMs) < 30_000) return history;
+  }
+  history.unshift(point);
+  const pruned = pruneLive(history);
+  flowLiveStore.set(key, pruned);
+  if (pgPool) {
+    pgPool.query(
+      `INSERT INTO flow_live_bars (underlying, strike, iso_ts, bar_data) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (underlying, strike, iso_ts) DO UPDATE SET bar_data=EXCLUDED.bar_data`,
+      [normalized, strike, point.isoTimestamp, point]
+    ).catch((e: Error) => console.error("[flow-live] upsert:", e.message));
+  }
+  return pruned;
+}
+
+
 // Automated CE/PE Flow Alerts
 type FlowAlertDirection = "BULLISH" | "BEARISH" | "NEUTRAL";
 type FlowAlertSeverity = "INFO" | "WATCH" | "HIGH" | "CRITICAL";
@@ -486,6 +576,7 @@ type StoredFlowAlert = {
   createdAt: string;
   isoTimestamp: string;
   timestamp: string;
+  underlying: string;
   strike: number;
   timeframe: "1m" | "3m";
   type: string;
@@ -535,6 +626,7 @@ async function ensureFlowAlertsTable(): Promise<void> {
       id            TEXT PRIMARY KEY,
       created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       iso_ts        TEXT NOT NULL,
+      underlying    TEXT NOT NULL DEFAULT 'NIFTY',
       strike        INTEGER NOT NULL,
       timeframe     TEXT NOT NULL,
       alert_type    TEXT NOT NULL,
@@ -548,7 +640,9 @@ async function ensureFlowAlertsTable(): Promise<void> {
       acknowledged  BOOLEAN NOT NULL DEFAULT FALSE
     )
   `);
+  await pgPool.query(`ALTER TABLE flow_alerts ADD COLUMN IF NOT EXISTS underlying TEXT NOT NULL DEFAULT 'NIFTY'`);
   await pgPool.query(`CREATE INDEX IF NOT EXISTS flow_alerts_created_at_idx ON flow_alerts (created_at DESC)`);
+  await pgPool.query(`CREATE INDEX IF NOT EXISTS flow_alerts_underlying_created_idx ON flow_alerts (underlying, created_at DESC)`);
   flowAlertsTableReady = true;
 }
 
@@ -561,13 +655,14 @@ async function persistFlowAlert(alert: StoredFlowAlert): Promise<void> {
   await ensureFlowAlertsTable();
   await pool.query(
     `INSERT INTO flow_alerts
-      (id, created_at, iso_ts, strike, timeframe, alert_type, direction, severity, score, spot, title, message, metrics, acknowledged)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)
+      (id, created_at, iso_ts, underlying, strike, timeframe, alert_type, direction, severity, score, spot, title, message, metrics, acknowledged)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15)
      ON CONFLICT (id) DO NOTHING`,
     [
       alert.id,
       alert.createdAt,
       alert.isoTimestamp,
+      normUnderlying(alert.underlying),
       alert.strike,
       alert.timeframe,
       alert.type,
@@ -589,7 +684,7 @@ async function getRecentFlowAlerts(limit = 50): Promise<StoredFlowAlert[]> {
   if (!pool) return alertMemory.slice(0, safeLimit);
   await ensureFlowAlertsTable();
   const { rows } = await pool.query(
-    `SELECT id, created_at, iso_ts, strike, timeframe, alert_type, direction, severity, score, spot, title, message, metrics, acknowledged
+    `SELECT id, created_at, iso_ts, underlying, strike, timeframe, alert_type, direction, severity, score, spot, title, message, metrics, acknowledged
      FROM flow_alerts
      ORDER BY created_at DESC
      LIMIT $1`,
@@ -600,6 +695,7 @@ async function getRecentFlowAlerts(limit = 50): Promise<StoredFlowAlert[]> {
     createdAt: new Date(r.created_at).toISOString(),
     isoTimestamp: r.iso_ts,
     timestamp: new Date(r.iso_ts).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" }),
+    underlying: normUnderlying(r.underlying || "NIFTY"),
     strike: Number(r.strike),
     timeframe: r.timeframe,
     type: r.alert_type,
@@ -632,7 +728,7 @@ function buildFlowAlert(input: Omit<StoredFlowAlert, "id" | "createdAt" | "sever
   const score = clampScore(input.score);
   return {
     ...input,
-    id: crypto.createHash("sha1").update(`${input.isoTimestamp}:${input.strike}:${input.type}:${input.direction}`).digest("hex").slice(0, 16),
+    id: crypto.createHash("sha1").update(`${input.isoTimestamp}:${normUnderlying(input.underlying)}:${input.strike}:${input.type}:${input.direction}:${input.metrics?.triggerSide || ""}`).digest("hex").slice(0, 16),
     createdAt: new Date().toISOString(),
     score,
     severity: severityFromScore(score),
@@ -641,161 +737,825 @@ function buildFlowAlert(input: Omit<StoredFlowAlert, "id" | "createdAt" | "sever
 }
 
 async function pushFlowAlert(alert: StoredFlowAlert): Promise<void> {
-  const key = `${alert.type}:${alert.direction}:${alert.strike}`;
+  const triggerSide = String(alert.metrics?.triggerSide || "");
+  const key = `${normUnderlying(alert.underlying)}:${alert.type}:${alert.direction}:${alert.strike}:${triggerSide}`;
   const last = recentAlertKeys.get(key) || 0;
-  if (Date.now() - last < FLOW_ALERT_DEDUPE_MS) return;
+  const dedupeMs = alert.type === "HIGH_VOLUME_EVENT" ? FLOW_ALERT_HIGH_VOLUME_DEDUPE_MS : FLOW_ALERT_DEDUPE_MS;
+  if (Date.now() - last < dedupeMs) return;
   recentAlertKeys.set(key, Date.now());
   await persistFlowAlert(alert);
-  console.log(`[flow-alert] ${alert.severity} ${alert.direction} ${alert.strike}: ${alert.title}`);
+  console.log(`[flow-alert] ${alert.severity} ${normUnderlying(alert.underlying)} ${alert.direction} ${alert.strike}: ${alert.title}`);
 }
 
-async function evaluateAndStoreFlowAlerts(strike: number, curr: any, prev: any): Promise<void> {
-  if (!curr || !prev) return;
+type TrapWatch = {
+  id: string;
+  underlying: string;
+  strike: number;
+  startedAtMs: number;
+  expiresAtMs: number;
+  isoTimestamp: string;
+  timestamp: string;
+  initialSpot: number;
+  initialSpotChg: number;
+  initialHigh: number;
+  initialLow: number;
+  high: number;
+  low: number;
+  brokenHigh: boolean;
+  brokenLow: boolean;
+  hint: FlowAlertDirection;
+  maxVolZ: number;
+  maxVolRatio: number;
+  maxVolume: number;
+  triggerSide: "CE" | "PE" | "BOTH";
+  callVolZ: number;
+  putVolZ: number;
+  callVolRatio: number;
+  putVolRatio: number;
+  callVolume: number;
+  putVolume: number;
+};
 
-  const spot = num(curr.spot);
-  const prevSpot = num(prev.spot);
-  const spotChg = spot - prevSpot;
-  const absSpotChg = Math.abs(spotChg);
-  const dist = strike - spot;
-  if (!spot || Math.abs(dist) > FLOW_ALERT_MAX_STRIKE_DISTANCE) return;
+type SideVolStats = {
+  ready: boolean;
+  volume: number;
+  mean: number;
+  stdev: number;
+  zscore: number;
+  volRatio: number;
+  spike: boolean;
+  samples: number;
+};
 
-  const callCOI = num(curr.call?.coi);
-  const putCOI = num(curr.put?.coi);
-  const callOI = num(curr.call?.oi);
-  const putOI = num(curr.put?.oi);
+const trapWatches = new Map<string, TrapWatch>();
+
+function avg(values: number[]): number {
+  if (!values.length) return 0;
+  return values.reduce((sum, v) => sum + v, 0) / values.length;
+}
+
+function pstdev(values: number[], meanValue: number): number {
+  if (!values.length) return 0;
+  const variance = values.reduce((sum, v) => sum + Math.pow(v - meanValue, 2), 0) / values.length;
+  return Math.sqrt(variance);
+}
+
+function sideVolDelta(point: any, side: "call" | "put"): number {
+  return Math.max(0, num(point?.[side]?.volDelta));
+}
+
+function calcSideVolumeStats(underlying: string, strike: number, curr: any, side: "call" | "put"): SideVolStats {
+  const history = getFlowAlertHistory(underlying, strike);
+  const volume = sideVolDelta(curr, side);
+  const prior = history
+    .slice(1, FLOW_ALERT_VOLUME_LOOKBACK + 1)
+    .map((p) => sideVolDelta(p, side))
+    .filter((v) => Number.isFinite(v) && v >= 0);
+
+  const neededSamples = Math.min(FLOW_ALERT_VOLUME_LOOKBACK, FLOW_ALERT_MIN_VOLUME_SAMPLES);
+  if (prior.length < neededSamples) {
+    return { ready: false, volume, mean: 0, stdev: 0, zscore: 0, volRatio: 0, spike: false, samples: prior.length };
+  }
+
+  const mean = avg(prior);
+  const stdev = pstdev(prior, mean);
+  if (stdev <= 0) {
+    return { ready: false, volume, mean, stdev, zscore: 0, volRatio: 0, spike: false, samples: prior.length };
+  }
+
+  const zscore = (volume - mean) / stdev;
+  const volRatio = volume / stdev;
+  const spike = volume >= flowAlertMinVolume(underlying) && (zscore >= FLOW_ALERT_MIN_VOL_ZSCORE || volRatio >= FLOW_ALERT_MIN_VOL_RATIO);
+  return { ready: true, volume, mean, stdev, zscore, volRatio, spike, samples: prior.length };
+}
+
+function flowAlertMinVolume(underlying: string): number {
+  const u = normUnderlying(underlying);
+  if (u === "SENSEX") return FLOW_ALERT_MIN_VOLUME_SENSEX;
+  if (u === "BANKNIFTY") return FLOW_ALERT_MIN_VOLUME_BANKNIFTY;
+  return FLOW_ALERT_MIN_VOLUME_NIFTY;
+}
+
+function flowStrikeStep(underlying: string, _spot: number): number {
+  const u = normUnderlying(underlying);
+  if (u === "SENSEX") return FLOW_ALERT_SENSEX_STEP;
+  if (u === "BANKNIFTY") return FLOW_ALERT_BANKNIFTY_STEP;
+  return FLOW_ALERT_NIFTY_STEP;
+}
+
+function nearestFlowStrike(underlying: string, spot: number): number {
+  const step = flowStrikeStep(underlying, spot);
+  return Math.round(spot / step) * step;
+}
+
+function isFlowStrikeInScope(underlying: string, strike: number, spot: number): boolean {
+  if (FLOW_ALERT_SCAN_ALL_STRIKES) return true;
+  const atm = nearestFlowStrike(underlying, spot);
+  const step = flowStrikeStep(underlying, spot);
+  return Math.abs(strike - atm) <= FLOW_ALERT_ATM_RANGE_STEPS * step && Math.abs(strike - spot) <= FLOW_ALERT_MAX_STRIKE_DISTANCE;
+}
+
+function classifyFlowAction(priceDelta: number, oiDelta: number): string {
+  if (priceDelta > 0 && oiDelta > 0) return "LONG_BUILDUP";
+  if (priceDelta > 0 && oiDelta < 0) return "SHORT_COVERING";
+  if (priceDelta < 0 && oiDelta > 0) return "SHORT_BUILDUP";
+  if (priceDelta < 0 && oiDelta < 0) return "LONG_UNWINDING";
+  return "NEUTRAL";
+}
+
+function trapKey(underlying: string, strike: number): string {
+  return `${normUnderlying(underlying)}|${strike}`;
+}
+
+function inferTrapHint(curr: any, prev: any, callStats: SideVolStats, putStats: SideVolStats): FlowAlertDirection {
+  const spotChg = num(curr.spot) - num(prev?.spot);
   const callPrem = num(curr.call?.premiumRoc);
   const putPrem = num(curr.put?.premiumRoc);
-  const callIvRoc = num(curr.call?.ivRoc);
-  const putIvRoc = num(curr.put?.ivRoc);
-  const callOiRatio = putOI > 0 ? callOI / putOI : 0;
-  const putOiRatio = callOI > 0 ? putOI / callOI : 0;
+  const premiumBias = callPrem - putPrem;
 
-  const baseMetrics = {
+  // PE-side panic/high volume on a down push can become a Bear Trap -> BUY_CE if the low survives.
+  if (putStats.spike && (spotChg <= -FLOW_ALERT_MIN_SPOT_MOVE || premiumBias <= -FLOW_ALERT_PREMIUM_BIAS_MIN)) return "BULLISH";
+
+  // CE-side chase/high volume on an up push can become a Bull Trap -> BUY_PE if the high survives.
+  if (callStats.spike && (spotChg >= FLOW_ALERT_MIN_SPOT_MOVE || premiumBias >= FLOW_ALERT_PREMIUM_BIAS_MIN)) return "BEARISH";
+
+  if (spotChg <= -FLOW_ALERT_MIN_SPOT_MOVE && putPrem >= callPrem) return "BULLISH";
+  if (spotChg >= FLOW_ALERT_MIN_SPOT_MOVE && callPrem >= putPrem) return "BEARISH";
+  return "NEUTRAL";
+}
+
+function buildTrapBaseMetrics(curr: any, prev: any, callStats: SideVolStats, putStats: SideVolStats, watch?: TrapWatch): Record<string, any> {
+  const spot = num(curr.spot);
+  const prevSpot = num(prev?.spot);
+  const callCOI = num(curr.call?.coi);
+  const putCOI = num(curr.put?.coi);
+  const callPrem = num(curr.call?.premiumRoc);
+  const putPrem = num(curr.put?.premiumRoc);
+  return {
     spot,
     prevSpot,
-    spotChg: Number(spotChg.toFixed(2)),
-    distanceFromSpot: Number(dist.toFixed(2)),
+    spotChg: Number((spot - prevSpot).toFixed(2)),
     callCOI,
     putCOI,
-    callOI,
-    putOI,
     callPremiumRoc: callPrem,
     putPremiumRoc: putPrem,
-    callIvRoc,
-    putIvRoc,
-    callOiRatio: Number(callOiRatio.toFixed(2)),
-    putOiRatio: Number(putOiRatio.toFixed(2)),
+    callIvRoc: num(curr.call?.ivRoc),
+    putIvRoc: num(curr.put?.ivRoc),
+    callVolume: callStats.volume,
+    putVolume: putStats.volume,
+    callVolZ: Number(callStats.zscore.toFixed(2)),
+    putVolZ: Number(putStats.zscore.toFixed(2)),
+    callVolRatio: Number(callStats.volRatio.toFixed(2)),
+    putVolRatio: Number(putStats.volRatio.toFixed(2)),
+    callVolSamples: callStats.samples,
+    putVolSamples: putStats.samples,
+    premiumBias: Number((callPrem - putPrem).toFixed(2)),
+    callAction: classifyFlowAction(callPrem, callCOI),
+    putAction: classifyFlowAction(putPrem, putCOI),
+    ...(watch ? {
+      eventSpot: watch.initialSpot,
+      eventHigh: watch.initialHigh,
+      eventLow: watch.initialLow,
+      rangeHigh: watch.high,
+      rangeLow: watch.low,
+      brokenHigh: watch.brokenHigh,
+      brokenLow: watch.brokenLow,
+      validationMinutes: Math.round(FLOW_ALERT_TRAP_WAIT_MS / 60000),
+      triggerSide: watch.triggerSide,
+      trapHint: watch.hint,
+      maxVolZ: Number(watch.maxVolZ.toFixed(2)),
+      maxVolRatio: Number(watch.maxVolRatio.toFixed(2)),
+      maxVolume: watch.maxVolume,
+    } : {}),
   };
+}
 
-  const nearResistance = dist >= -25 && dist <= 125;
-  const nearSupport = dist <= 25 && dist >= -125;
-  const alerts: StoredFlowAlert[] = [];
+async function startTrapWatch(underlying: string, strike: number, curr: any, prev: any, callStats: SideVolStats, putStats: SideVolStats): Promise<void> {
+  const normalized = normUnderlying(underlying);
+  const key = trapKey(normalized, strike);
+  const nowMs = new Date(curr.isoTimestamp).getTime();
+  const active = trapWatches.get(key);
+  if (active && nowMs <= active.expiresAtMs) return;
 
-  if (strike < spot && spotChg >= FLOW_ALERT_MIN_SPOT_MOVE && callPrem > 0 && callPrem <= spotChg * 0.60 && callCOI <= -FLOW_ALERT_MIN_COI) {
-    const premiumEfficiency = callPrem / Math.max(spotChg, 0.01);
-    const score = 55 + Math.min(25, Math.abs(callCOI) / FLOW_ALERT_MIN_COI * 5) + Math.min(20, (0.60 - premiumEfficiency) * 60);
-    alerts.push(buildFlowAlert({
+  const spot = num(curr.spot);
+  const prevSpot = num(prev?.spot);
+  const hint = inferTrapHint(curr, prev, callStats, putStats);
+  const triggerSide = callStats.spike && putStats.spike ? "BOTH" : (callStats.spike ? "CE" : "PE");
+  const watch: TrapWatch = {
+    id: crypto.createHash("sha1").update(`${curr.isoTimestamp}:${normalized}:${strike}:trap-watch`).digest("hex").slice(0, 12),
+    underlying: normalized,
+    strike,
+    startedAtMs: nowMs,
+    expiresAtMs: nowMs + FLOW_ALERT_TRAP_WAIT_MS,
+    isoTimestamp: curr.isoTimestamp,
+    timestamp: curr.timestamp,
+    initialSpot: spot,
+    initialSpotChg: spot - prevSpot,
+    initialHigh: Math.max(spot, prevSpot || spot),
+    initialLow: Math.min(spot, prevSpot || spot),
+    high: Math.max(spot, prevSpot || spot),
+    low: Math.min(spot, prevSpot || spot),
+    brokenHigh: false,
+    brokenLow: false,
+    hint,
+    maxVolZ: Math.max(callStats.zscore, putStats.zscore),
+    maxVolRatio: Math.max(callStats.volRatio, putStats.volRatio),
+    maxVolume: Math.max(callStats.volume, putStats.volume),
+    triggerSide,
+    callVolZ: callStats.zscore,
+    putVolZ: putStats.zscore,
+    callVolRatio: callStats.volRatio,
+    putVolRatio: putStats.volRatio,
+    callVolume: callStats.volume,
+    putVolume: putStats.volume,
+  };
+  trapWatches.set(key, watch);
+
+  const score = clampScore(48 + Math.min(20, watch.maxVolZ * 4) + Math.min(12, watch.maxVolRatio));
+  const hintText = hint === "BULLISH"
+    ? "Possible Bear Trap. Wait 5 minutes; BUY CE only if the event low is not broken and CE flow confirms."
+    : hint === "BEARISH"
+      ? "Possible Bull Trap. Wait 5 minutes; BUY PE only if the event high is not broken and PE flow confirms."
+      : "Direction unclear. Wait 5 minutes for CE/PE premium and range confirmation.";
+
+  await pushFlowAlert(buildFlowAlert({
+    isoTimestamp: curr.isoTimestamp,
+    timestamp: curr.timestamp,
+    underlying: normalized,
+    strike,
+    timeframe: "1m",
+    type: "HIGH_VOLUME_EVENT",
+    direction: "NEUTRAL",
+    score,
+    spot,
+    title: `${normalized} high volume event ${strike} ${triggerSide} - wait 5 minutes`,
+    message: `Immediate information alert: abnormal SD${FLOW_ALERT_VOLUME_LOOKBACK} volume detected on ${normalized} ${strike} ${triggerSide}. ${hintText} Event range: high ${fmtP(watch.initialHigh)}, low ${fmtP(watch.initialLow)}.`,
+    metrics: buildTrapBaseMetrics(curr, prev, callStats, putStats, watch),
+  }));
+}
+
+async function updateTrapWatchAndMaybeAlert(underlying: string, strike: number, curr: any, prev: any, callStats: SideVolStats, putStats: SideVolStats): Promise<void> {
+  const normalized = normUnderlying(underlying);
+  const key = trapKey(normalized, strike);
+  const watch = trapWatches.get(key);
+  if (!watch) return;
+
+  const nowMs = new Date(curr.isoTimestamp).getTime();
+  const spot = num(curr.spot);
+  watch.high = Math.max(watch.high, spot);
+  watch.low = Math.min(watch.low, spot);
+  if (spot > watch.initialHigh + FLOW_ALERT_BREAK_BUFFER) watch.brokenHigh = true;
+  if (spot < watch.initialLow - FLOW_ALERT_BREAK_BUFFER) watch.brokenLow = true;
+
+  if (nowMs < watch.expiresAtMs) return;
+
+  const callPrem = num(curr.call?.premiumRoc);
+  const putPrem = num(curr.put?.premiumRoc);
+  const callCOI = num(curr.call?.coi);
+  const putCOI = num(curr.put?.coi);
+  const premiumBias = callPrem - putPrem;
+  const callAction = classifyFlowAction(callPrem, callCOI);
+  const putAction = classifyFlowAction(putPrem, putCOI);
+
+  const bullishOiOk = (callPrem > 0 && callCOI >= -FLOW_ALERT_MIN_COI) || (putPrem < 0 && Math.abs(putCOI) >= FLOW_ALERT_MIN_COI) || putAction === "SHORT_BUILDUP" || putAction === "LONG_UNWINDING";
+  const bearishOiOk = (putPrem > 0 && putCOI >= -FLOW_ALERT_MIN_COI) || (callPrem < 0 && Math.abs(callCOI) >= FLOW_ALERT_MIN_COI) || callAction === "SHORT_BUILDUP" || callAction === "LONG_UNWINDING";
+  const bullishFlowOk = !watch.brokenLow && ((callPrem > 0 && putPrem <= 0) || premiumBias >= FLOW_ALERT_PREMIUM_BIAS_MIN || bullishOiOk);
+  const bearishFlowOk = !watch.brokenHigh && ((putPrem > 0 && callPrem <= 0) || -premiumBias >= FLOW_ALERT_PREMIUM_BIAS_MIN || bearishOiOk);
+
+  let finalDirection: FlowAlertDirection = "NEUTRAL";
+  let type = "";
+  let title = "";
+  let message = "";
+  let score = 0;
+
+  const bullishScore = 64
+    + (watch.brokenLow ? 0 : 14)
+    + (callPrem > 0 ? 8 : 0)
+    + (premiumBias >= FLOW_ALERT_PREMIUM_BIAS_MIN ? 8 : 0)
+    + (bullishOiOk ? 8 : 0)
+    + Math.min(8, watch.maxVolZ);
+  const bearishScore = 64
+    + (watch.brokenHigh ? 0 : 14)
+    + (putPrem > 0 ? 8 : 0)
+    + (-premiumBias >= FLOW_ALERT_PREMIUM_BIAS_MIN ? 8 : 0)
+    + (bearishOiOk ? 8 : 0)
+    + Math.min(8, watch.maxVolZ);
+
+  const preferBullish = watch.hint === "BULLISH" || (watch.hint === "NEUTRAL" && bullishScore >= bearishScore);
+  const preferBearish = watch.hint === "BEARISH" || (watch.hint === "NEUTRAL" && bearishScore > bullishScore);
+
+  if (preferBullish && bullishFlowOk && bullishScore >= 70) {
+    finalDirection = "BULLISH";
+    type = "BEAR_TRAP_BUY_CE";
+    title = `${normalized} Bear Trap confirmed - BUY CE watch at ${strike}`;
+    message = `High volume event low held for 5 minutes. Spot did not break below ${fmtP(watch.initialLow)}; CE flow is stronger now. BUY CE is valid while spot holds above event low.`;
+    score = bullishScore;
+  } else if (preferBearish && bearishFlowOk && bearishScore >= 70) {
+    finalDirection = "BEARISH";
+    type = "BULL_TRAP_BUY_PE";
+    title = `${normalized} Bull Trap confirmed - BUY PE watch at ${strike}`;
+    message = `High volume event high held for 5 minutes. Spot did not break above ${fmtP(watch.initialHigh)}; PE flow is stronger now. BUY PE is valid while spot stays below event high.`;
+    score = bearishScore;
+  }
+
+  if (type) {
+    await pushFlowAlert(buildFlowAlert({
       isoTimestamp: curr.isoTimestamp,
       timestamp: curr.timestamp,
+      underlying: normalized,
       strike,
       timeframe: "1m",
-      type: "ITM_CE_EXHAUSTION",
-      direction: "BEARISH",
+      type,
+      direction: finalDirection,
       score,
       spot,
-      title: `ITM CE premium underperformance at ${strike}`,
-      message: `Spot rose ${fmtP(spotChg)}, but ${strike} CE premium rose only ${fmtP(callPrem)} while CE OI reduced by ${fmtN(Math.abs(callCOI))}. This looks like call short-covering/exhaustion, not strong fresh buying.`,
-      metrics: { ...baseMetrics, premiumEfficiency: Number(premiumEfficiency.toFixed(2)) },
+      title,
+      message,
+      metrics: buildTrapBaseMetrics(curr, prev, callStats, putStats, watch),
     }));
   }
 
-  if (nearResistance && callCOI >= FLOW_ALERT_MIN_COI && callOiRatio >= 1.35 && callPrem <= Math.max(0.75, Math.max(spotChg, 0) * 0.30)) {
-    const score = 58 + Math.min(22, callCOI / FLOW_ALERT_MIN_COI * 4) + Math.min(20, callOiRatio * 5);
-    alerts.push(buildFlowAlert({
-      isoTimestamp: curr.isoTimestamp,
-      timestamp: curr.timestamp,
-      strike,
-      timeframe: "1m",
-      type: "CALL_WRITING_RESISTANCE",
-      direction: "BEARISH",
-      score,
-      spot,
-      title: `Call wall / absorption near ${strike}`,
-      message: `${strike} CE added ${fmtN(callCOI)} OI, but CE premium changed only ${fmtP(callPrem)}. CE OI is ${callOiRatio.toFixed(2)}x PE OI, so resistance may be building near this strike.`,
-      metrics: baseMetrics,
-    }));
+  trapWatches.delete(key);
+}
+
+async function evaluateAndStoreFlowAlerts(underlying: string, strike: number, curr: any, prev: any): Promise<void> {
+  if (!curr || !prev) return;
+
+  const normalized = normUnderlying(underlying);
+  const spot = num(curr.spot);
+  if (!spot || !isFlowStrikeInScope(normalized, strike, spot)) return;
+
+  const callStats = calcSideVolumeStats(normalized, strike, curr, "call");
+  const putStats = calcSideVolumeStats(normalized, strike, curr, "put");
+
+  await updateTrapWatchAndMaybeAlert(normalized, strike, curr, prev, callStats, putStats);
+
+  // Immediate information alert: as soon as SD200 abnormal volume is detected
+  // on any scanned CE/PE option, the alert fires. Direction/trade alerts are
+  // still delayed until the 5-minute trap validation completes.
+  if ((callStats.spike || putStats.spike) && !trapWatches.has(trapKey(normalized, strike))) {
+    await startTrapWatch(normalized, strike, curr, prev, callStats, putStats);
+  }
+}
+
+// SD200 trap backtest engine
+type FlowBacktestRequest = {
+  underlying?: string;
+  date?: string;
+  fromTime?: string;
+  toTime?: string;
+  strike?: number | string;
+  trapWaitMinutes?: number | string;
+  targetPoints?: number | string;
+  breakBuffer?: number | string;
+  minVolZscore?: number | string;
+  minVolRatio?: number | string;
+  minVolume?: number | string;
+  minSamples?: number | string;
+  lookback?: number | string;
+  outcomeMinutes?: number | string;
+};
+
+type FlowBacktestEvent = {
+  id: string;
+  isoTimestamp: string;
+  timestamp: string;
+  underlying: string;
+  strike: number;
+  side: "CE" | "PE" | "BOTH";
+  type: "HIGH_VOLUME_EVENT" | "BEAR_TRAP_BUY_CE" | "BULL_TRAP_BUY_PE";
+  direction: FlowAlertDirection;
+  action: "WAIT" | "BUY_CE" | "BUY_PE";
+  spot: number;
+  eventHigh: number;
+  eventLow: number;
+  score: number;
+  result?: "WIN" | "LOSS" | "NEUTRAL" | "OPEN";
+  pnlPoints?: number;
+  exitSpot?: number;
+  exitIsoTimestamp?: string;
+  reason: string;
+  metrics: Record<string, any>;
+};
+
+type BacktestSideStats = SideVolStats;
+type BacktestWatch = TrapWatch & { eventIndex: number };
+
+function parseFiniteNumber(value: any, fallback: number): number {
+  const n = typeof value === "number" ? value : parseFloat(String(value ?? ""));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function parsePositiveInt(value: any, fallback: number): number {
+  const n = parseInt(String(value ?? ""), 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function istDateTimeToIso(dateStr: string, timeStr: string): string {
+  const safeDate = /^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? dateStr : getISTDateStr(new Date());
+  const safeTime = /^\d{2}:\d{2}$/.test(timeStr) ? timeStr : "09:15";
+  return new Date(`${safeDate}T${safeTime}:00+05:30`).toISOString();
+}
+
+function istDisplayTime(iso: string): string {
+  return new Date(iso).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" });
+}
+
+function backtestDefaultTargetPoints(underlying: string): number {
+  const u = normUnderlying(underlying);
+  if (u === "SENSEX") return 80;
+  if (u === "BANKNIFTY") return 80;
+  return 25;
+}
+
+function backtestMinVolume(underlying: string, custom?: number): number {
+  return Number.isFinite(custom) && custom! > 0 ? custom! : flowAlertMinVolume(underlying);
+}
+
+function calcBacktestSideVolumeStats(
+  priorPoints: any[],
+  curr: any,
+  side: "call" | "put",
+  lookback: number,
+  minSamples: number,
+  minVolume: number,
+  minVolZscore: number,
+  minVolRatio: number,
+): BacktestSideStats {
+  const volume = sideVolDelta(curr, side);
+  const prior = priorPoints
+    .slice(-lookback)
+    .map((p) => sideVolDelta(p, side))
+    .filter((v) => Number.isFinite(v) && v >= 0);
+  const needed = Math.min(lookback, minSamples);
+  if (prior.length < needed) {
+    return { ready: false, volume, mean: 0, stdev: 0, zscore: 0, volRatio: 0, spike: false, samples: prior.length };
+  }
+  const mean = avg(prior);
+  const stdev = pstdev(prior, mean);
+  if (stdev <= 0) {
+    return { ready: false, volume, mean, stdev, zscore: 0, volRatio: 0, spike: false, samples: prior.length };
+  }
+  const zscore = (volume - mean) / stdev;
+  const volRatio = volume / stdev;
+  return {
+    ready: true,
+    volume,
+    mean,
+    stdev,
+    zscore,
+    volRatio,
+    spike: volume >= minVolume && (zscore >= minVolZscore || volRatio >= minVolRatio),
+    samples: prior.length,
+  };
+}
+
+function inferBacktestTrapHint(curr: any, prev: any, callStats: BacktestSideStats, putStats: BacktestSideStats, minSpotMove: number, premiumBiasMin: number): FlowAlertDirection {
+  const spotChg = num(curr.spot) - num(prev?.spot);
+  const callPrem = num(curr.call?.premiumRoc);
+  const putPrem = num(curr.put?.premiumRoc);
+  const premiumBias = callPrem - putPrem;
+  if (putStats.spike && (spotChg <= -minSpotMove || premiumBias <= -premiumBiasMin)) return "BULLISH";
+  if (callStats.spike && (spotChg >= minSpotMove || premiumBias >= premiumBiasMin)) return "BEARISH";
+  if (spotChg <= -minSpotMove && putPrem >= callPrem) return "BULLISH";
+  if (spotChg >= minSpotMove && callPrem >= putPrem) return "BEARISH";
+  return "NEUTRAL";
+}
+
+function buildBacktestMetrics(curr: any, prev: any, callStats: BacktestSideStats, putStats: BacktestSideStats, watch?: BacktestWatch | TrapWatch): Record<string, any> {
+  return buildTrapBaseMetrics(curr, prev, callStats, putStats, watch as TrapWatch | undefined);
+}
+
+async function fetchBacktestRows(underlying: string, seedFromIso: string, endIso: string, strikeFilter?: number): Promise<{ source: string; rows: Array<{ strike: number; bar: any }> }> {
+  const normalized = normUnderlying(underlying);
+  const out: Array<{ strike: number; bar: any }> = [];
+  if (!pgPool) {
+    for (const [key, bars] of flowLiveStore.entries()) {
+      const [u, strikeText] = key.split("|");
+      if (normUnderlying(u) !== normalized) continue;
+      const strike = Number(strikeText);
+      if (strikeFilter && strike !== strikeFilter) continue;
+      for (const bar of bars) {
+        const iso = String(bar?.isoTimestamp || "");
+        if (iso >= seedFromIso && iso <= endIso) out.push({ strike, bar });
+      }
+    }
+    out.sort((a, b) => new Date(a.bar.isoTimestamp).getTime() - new Date(b.bar.isoTimestamp).getTime() || a.strike - b.strike);
+    return { source: "memory:flow_live_bars", rows: out };
   }
 
-  if (spotChg <= -FLOW_ALERT_MIN_SPOT_MOVE && ((callCOI >= FLOW_ALERT_MIN_COI && callPrem < 0) || (putCOI >= FLOW_ALERT_MIN_COI && putPrem > 0))) {
-    const score = 65 + Math.min(20, (Math.max(callCOI, 0) + Math.max(putCOI, 0)) / FLOW_ALERT_MIN_COI * 3) + Math.min(15, absSpotChg);
-    alerts.push(buildFlowAlert({
-      isoTimestamp: curr.isoTimestamp,
-      timestamp: curr.timestamp,
-      strike,
-      timeframe: "1m",
-      type: "BEARISH_CONFIRMATION",
-      direction: "BEARISH",
-      score,
-      spot,
-      title: `Bearish flow confirmation at ${strike}`,
-      message: `Spot fell ${fmtP(spotChg)}. CE premium ${fmtP(callPrem)} with CE COI ${fmtN(callCOI)}, and PE premium ${fmtP(putPrem)} with PE COI ${fmtN(putCOI)}. Reversal/fall is getting confirmation.`,
-      metrics: baseMetrics,
-    }));
+  const params: any[] = [normalized, seedFromIso, endIso];
+  let strikeSql = "";
+  if (strikeFilter) {
+    params.push(strikeFilter);
+    strikeSql = ` AND strike = ${params.length}`;
+  }
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT strike, bar_data FROM flow_live_bars
+       WHERE underlying=$1 AND iso_ts >= $2 AND iso_ts <= $3 ${strikeSql}
+       ORDER BY iso_ts ASC, strike ASC`,
+      params
+    );
+    if (rows.length) {
+      return { source: "flow_live_bars", rows: rows.map((r: any) => ({ strike: Number(r.strike), bar: r.bar_data })) };
+    }
+  } catch (e: any) {
+    console.error("[flow-backtest] flow_live_bars fetch failed:", e.message);
   }
 
-  if (strike > spot && spotChg <= -FLOW_ALERT_MIN_SPOT_MOVE && putPrem > 0 && putPrem <= absSpotChg * 0.60 && putCOI <= -FLOW_ALERT_MIN_COI) {
-    const premiumEfficiency = putPrem / Math.max(absSpotChg, 0.01);
-    const score = 55 + Math.min(25, Math.abs(putCOI) / FLOW_ALERT_MIN_COI * 5) + Math.min(20, (0.60 - premiumEfficiency) * 60);
-    alerts.push(buildFlowAlert({
-      isoTimestamp: curr.isoTimestamp,
-      timestamp: curr.timestamp,
-      strike,
-      timeframe: "1m",
-      type: "ITM_PE_EXHAUSTION",
-      direction: "BULLISH",
-      score,
-      spot,
-      title: `ITM PE premium underperformance at ${strike}`,
-      message: `Spot fell ${fmtP(spotChg)}, but ${strike} PE premium rose only ${fmtP(putPrem)} while PE OI reduced by ${fmtN(Math.abs(putCOI))}. Downside may be exhausting.`,
-      metrics: { ...baseMetrics, premiumEfficiency: Number(premiumEfficiency.toFixed(2)) },
-    }));
+  let table = "";
+  if (normalized === "NIFTY") table = "live_bars";
+  else if (normalized === "SENSEX") table = "sensex_bars";
+  else return { source: "flow_live_bars", rows: [] };
+  const fallbackParams: any[] = [seedFromIso, endIso];
+  let fallbackStrikeSql = "";
+  if (strikeFilter) {
+    fallbackParams.push(strikeFilter);
+    fallbackStrikeSql = ` AND strike = ${fallbackParams.length}`;
+  }
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT strike, bar_data FROM ${table}
+       WHERE iso_ts >= $1 AND iso_ts <= $2 ${fallbackStrikeSql}
+       ORDER BY iso_ts ASC, strike ASC`,
+      fallbackParams
+    );
+    return { source: table, rows: rows.map((r: any) => ({ strike: Number(r.strike), bar: r.bar_data })) };
+  } catch (e: any) {
+    console.error(`[flow-backtest] ${table} fetch failed:`, e.message);
+    return { source: table, rows: [] };
+  }
+}
+
+function scoreBacktestEvent(maxVolZ: number, maxVolRatio: number): number {
+  return clampScore(48 + Math.min(20, maxVolZ * 4) + Math.min(12, maxVolRatio));
+}
+
+function resolveBacktestOutcome(
+  rowsForStrike: any[],
+  startIndex: number,
+  action: "BUY_CE" | "BUY_PE",
+  entrySpot: number,
+  eventHigh: number,
+  eventLow: number,
+  targetPoints: number,
+  breakBuffer: number,
+  outcomeMinutes: number,
+): Pick<FlowBacktestEvent, "result" | "pnlPoints" | "exitSpot" | "exitIsoTimestamp"> {
+  const entryIso = rowsForStrike[startIndex]?.isoTimestamp;
+  const deadline = entryIso ? new Date(new Date(entryIso).getTime() + outcomeMinutes * 60_000).toISOString() : "";
+  let lastSpot = entrySpot;
+  let lastIso = entryIso;
+  for (let i = startIndex + 1; i < rowsForStrike.length; i++) {
+    const p = rowsForStrike[i];
+    if (!p?.isoTimestamp || p.isoTimestamp > deadline) break;
+    const spot = num(p.spot);
+    lastSpot = spot;
+    lastIso = p.isoTimestamp;
+    if (action === "BUY_CE") {
+      if (spot <= eventLow - breakBuffer) return { result: "LOSS", pnlPoints: Number((spot - entrySpot).toFixed(2)), exitSpot: spot, exitIsoTimestamp: p.isoTimestamp };
+      if (spot >= entrySpot + targetPoints) return { result: "WIN", pnlPoints: Number((spot - entrySpot).toFixed(2)), exitSpot: spot, exitIsoTimestamp: p.isoTimestamp };
+    } else {
+      if (spot >= eventHigh + breakBuffer) return { result: "LOSS", pnlPoints: Number((entrySpot - spot).toFixed(2)), exitSpot: spot, exitIsoTimestamp: p.isoTimestamp };
+      if (spot <= entrySpot - targetPoints) return { result: "WIN", pnlPoints: Number((entrySpot - spot).toFixed(2)), exitSpot: spot, exitIsoTimestamp: p.isoTimestamp };
+    }
+  }
+  const pnl = action === "BUY_CE" ? lastSpot - entrySpot : entrySpot - lastSpot;
+  return {
+    result: lastIso === entryIso ? "OPEN" : "NEUTRAL",
+    pnlPoints: Number(pnl.toFixed(2)),
+    exitSpot: lastSpot,
+    exitIsoTimestamp: lastIso,
+  };
+}
+
+async function runFlowTrapBacktest(input: FlowBacktestRequest) {
+  const underlying = normUnderlying(input.underlying || "NIFTY");
+  const dateStr = input.date && /^\d{4}-\d{2}-\d{2}$/.test(String(input.date)) ? String(input.date) : getISTDateStr(new Date());
+  const fromTime = String(input.fromTime || "09:15");
+  const toTime = String(input.toTime || "15:30");
+  const startIso = istDateTimeToIso(dateStr, fromTime);
+  const endIso = istDateTimeToIso(dateStr, toTime);
+  const seedFromIso = new Date(new Date(startIso).getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const strikeRaw = input.strike == null || String(input.strike).trim() === "" ? 0 : parseInt(String(input.strike), 10);
+  const strikeFilter = Number.isFinite(strikeRaw) && strikeRaw > 0 ? strikeRaw : undefined;
+  const lookback = parsePositiveInt(input.lookback, FLOW_ALERT_VOLUME_LOOKBACK);
+  const minSamples = parsePositiveInt(input.minSamples, FLOW_ALERT_MIN_VOLUME_SAMPLES);
+  const minVolZscore = parseFiniteNumber(input.minVolZscore, FLOW_ALERT_MIN_VOL_ZSCORE);
+  const minVolRatio = parseFiniteNumber(input.minVolRatio, FLOW_ALERT_MIN_VOL_RATIO);
+  const minVolume = backtestMinVolume(underlying, input.minVolume == null ? undefined : parseFiniteNumber(input.minVolume, 0));
+  const trapWaitMs = parseFiniteNumber(input.trapWaitMinutes, Math.round(FLOW_ALERT_TRAP_WAIT_MS / 60000)) * 60_000;
+  const breakBuffer = parseFiniteNumber(input.breakBuffer, FLOW_ALERT_BREAK_BUFFER);
+  const targetPoints = parseFiniteNumber(input.targetPoints, backtestDefaultTargetPoints(underlying));
+  const outcomeMinutes = parsePositiveInt(input.outcomeMinutes, 15);
+
+  const fetched = await fetchBacktestRows(underlying, seedFromIso, endIso, strikeFilter);
+  const grouped = new Map<number, any[]>();
+  for (const row of fetched.rows) {
+    const iso = String(row.bar?.isoTimestamp || "");
+    if (!iso) continue;
+    if (!grouped.has(row.strike)) grouped.set(row.strike, []);
+    grouped.get(row.strike)!.push(row.bar);
+  }
+  for (const bars of grouped.values()) {
+    bars.sort((a, b) => new Date(a.isoTimestamp).getTime() - new Date(b.isoTimestamp).getTime());
   }
 
-  if (nearSupport && putCOI >= FLOW_ALERT_MIN_COI && putOiRatio >= 1.35 && putPrem <= Math.max(0.75, Math.max(-spotChg, 0) * 0.30)) {
-    const score = 58 + Math.min(22, putCOI / FLOW_ALERT_MIN_COI * 4) + Math.min(20, putOiRatio * 5);
-    alerts.push(buildFlowAlert({
-      isoTimestamp: curr.isoTimestamp,
-      timestamp: curr.timestamp,
-      strike,
-      timeframe: "1m",
-      type: "PUT_WRITING_SUPPORT",
-      direction: "BULLISH",
-      score,
-      spot,
-      title: `Put wall / support near ${strike}`,
-      message: `${strike} PE added ${fmtN(putCOI)} OI, but PE premium changed only ${fmtP(putPrem)}. PE OI is ${putOiRatio.toFixed(2)}x CE OI, so support may be building near this strike.`,
-      metrics: baseMetrics,
-    }));
+  const events: FlowBacktestEvent[] = [];
+  const watches = new Map<number, BacktestWatch>();
+  const highVolDedupe = new Map<string, number>();
+
+  for (const [strike, bars] of grouped.entries()) {
+    const prior: any[] = [];
+    for (let i = 0; i < bars.length; i++) {
+      const curr = bars[i];
+      const prev = prior[prior.length - 1];
+      const iso = String(curr?.isoTimestamp || "");
+      if (!prev || !iso) {
+        prior.push(curr);
+        continue;
+      }
+
+      const callStats = calcBacktestSideVolumeStats(prior, curr, "call", lookback, minSamples, minVolume, minVolZscore, minVolRatio);
+      const putStats = calcBacktestSideVolumeStats(prior, curr, "put", lookback, minSamples, minVolume, minVolZscore, minVolRatio);
+      const spot = num(curr.spot);
+      const watch = watches.get(strike);
+      if (watch) {
+        const nowMs = new Date(iso).getTime();
+        watch.high = Math.max(watch.high, spot);
+        watch.low = Math.min(watch.low, spot);
+        if (spot > watch.initialHigh + breakBuffer) watch.brokenHigh = true;
+        if (spot < watch.initialLow - breakBuffer) watch.brokenLow = true;
+        if (nowMs >= watch.expiresAtMs) {
+          const callPrem = num(curr.call?.premiumRoc);
+          const putPrem = num(curr.put?.premiumRoc);
+          const callCOI = num(curr.call?.coi);
+          const putCOI = num(curr.put?.coi);
+          const premiumBias = callPrem - putPrem;
+          const callAction = classifyFlowAction(callPrem, callCOI);
+          const putAction = classifyFlowAction(putPrem, putCOI);
+          const bullishOiOk = (callPrem > 0 && callCOI >= -FLOW_ALERT_MIN_COI) || (putPrem < 0 && Math.abs(putCOI) >= FLOW_ALERT_MIN_COI) || putAction === "SHORT_BUILDUP" || putAction === "LONG_UNWINDING";
+          const bearishOiOk = (putPrem > 0 && putCOI >= -FLOW_ALERT_MIN_COI) || (callPrem < 0 && Math.abs(callCOI) >= FLOW_ALERT_MIN_COI) || callAction === "SHORT_BUILDUP" || callAction === "LONG_UNWINDING";
+          const bullishFlowOk = !watch.brokenLow && ((callPrem > 0 && putPrem <= 0) || premiumBias >= FLOW_ALERT_PREMIUM_BIAS_MIN || bullishOiOk);
+          const bearishFlowOk = !watch.brokenHigh && ((putPrem > 0 && callPrem <= 0) || -premiumBias >= FLOW_ALERT_PREMIUM_BIAS_MIN || bearishOiOk);
+          const bullishScore = 64 + (watch.brokenLow ? 0 : 14) + (callPrem > 0 ? 8 : 0) + (premiumBias >= FLOW_ALERT_PREMIUM_BIAS_MIN ? 8 : 0) + (bullishOiOk ? 8 : 0) + Math.min(8, watch.maxVolZ);
+          const bearishScore = 64 + (watch.brokenHigh ? 0 : 14) + (putPrem > 0 ? 8 : 0) + (-premiumBias >= FLOW_ALERT_PREMIUM_BIAS_MIN ? 8 : 0) + (bearishOiOk ? 8 : 0) + Math.min(8, watch.maxVolZ);
+          const preferBullish = watch.hint === "BULLISH" || (watch.hint === "NEUTRAL" && bullishScore >= bearishScore);
+          const preferBearish = watch.hint === "BEARISH" || (watch.hint === "NEUTRAL" && bearishScore > bullishScore);
+          let event: FlowBacktestEvent | null = null;
+          if (preferBullish && bullishFlowOk && bullishScore >= 70) {
+            const outcome = resolveBacktestOutcome(bars, i, "BUY_CE", spot, watch.initialHigh, watch.initialLow, targetPoints, breakBuffer, outcomeMinutes);
+            event = {
+              id: crypto.createHash("sha1").update(`${iso}:${underlying}:${strike}:BEAR_TRAP_BUY_CE`).digest("hex").slice(0, 16),
+              isoTimestamp: iso,
+              timestamp: istDisplayTime(iso),
+              underlying,
+              strike,
+              side: watch.triggerSide,
+              type: "BEAR_TRAP_BUY_CE",
+              direction: "BULLISH",
+              action: "BUY_CE",
+              spot,
+              eventHigh: watch.initialHigh,
+              eventLow: watch.initialLow,
+              score: clampScore(bullishScore),
+              reason: "Event low held for the validation window and CE flow confirmed.",
+              metrics: buildBacktestMetrics(curr, prev, callStats, putStats, watch),
+              ...outcome,
+            };
+          } else if (preferBearish && bearishFlowOk && bearishScore >= 70) {
+            const outcome = resolveBacktestOutcome(bars, i, "BUY_PE", spot, watch.initialHigh, watch.initialLow, targetPoints, breakBuffer, outcomeMinutes);
+            event = {
+              id: crypto.createHash("sha1").update(`${iso}:${underlying}:${strike}:BULL_TRAP_BUY_PE`).digest("hex").slice(0, 16),
+              isoTimestamp: iso,
+              timestamp: istDisplayTime(iso),
+              underlying,
+              strike,
+              side: watch.triggerSide,
+              type: "BULL_TRAP_BUY_PE",
+              direction: "BEARISH",
+              action: "BUY_PE",
+              spot,
+              eventHigh: watch.initialHigh,
+              eventLow: watch.initialLow,
+              score: clampScore(bearishScore),
+              reason: "Event high held for the validation window and PE flow confirmed.",
+              metrics: buildBacktestMetrics(curr, prev, callStats, putStats, watch),
+              ...outcome,
+            };
+          }
+          if (event) events.push(event);
+          watches.delete(strike);
+        }
+      }
+
+      const inRequestedWindow = iso >= startIso && iso <= endIso;
+      if (inRequestedWindow && !watches.has(strike) && (callStats.spike || putStats.spike)) {
+        const triggerSide: "CE" | "PE" | "BOTH" = callStats.spike && putStats.spike ? "BOTH" : (callStats.spike ? "CE" : "PE");
+        const dedupeKey = `${strike}:${triggerSide}`;
+        const last = highVolDedupe.get(dedupeKey) || 0;
+        const nowMs = new Date(iso).getTime();
+        if (nowMs - last >= FLOW_ALERT_HIGH_VOLUME_DEDUPE_MS) {
+          highVolDedupe.set(dedupeKey, nowMs);
+          const hint = inferBacktestTrapHint(curr, prev, callStats, putStats, FLOW_ALERT_MIN_SPOT_MOVE, FLOW_ALERT_PREMIUM_BIAS_MIN);
+          const eventHigh = Math.max(spot, num(prev.spot) || spot);
+          const eventLow = Math.min(spot, num(prev.spot) || spot);
+          const maxVolZ = Math.max(callStats.zscore, putStats.zscore);
+          const maxVolRatio = Math.max(callStats.volRatio, putStats.volRatio);
+          const maxVolume = Math.max(callStats.volume, putStats.volume);
+          const watch: BacktestWatch = {
+            id: crypto.createHash("sha1").update(`${iso}:${underlying}:${strike}:backtest-watch`).digest("hex").slice(0, 12),
+            underlying,
+            strike,
+            startedAtMs: nowMs,
+            expiresAtMs: nowMs + trapWaitMs,
+            isoTimestamp: iso,
+            timestamp: istDisplayTime(iso),
+            initialSpot: spot,
+            initialSpotChg: spot - num(prev.spot),
+            initialHigh: eventHigh,
+            initialLow: eventLow,
+            high: eventHigh,
+            low: eventLow,
+            brokenHigh: false,
+            brokenLow: false,
+            hint,
+            maxVolZ,
+            maxVolRatio,
+            maxVolume,
+            triggerSide,
+            callVolZ: callStats.zscore,
+            putVolZ: putStats.zscore,
+            callVolRatio: callStats.volRatio,
+            putVolRatio: putStats.volRatio,
+            callVolume: callStats.volume,
+            putVolume: putStats.volume,
+            eventIndex: i,
+          };
+          watches.set(strike, watch);
+          events.push({
+            id: crypto.createHash("sha1").update(`${iso}:${underlying}:${strike}:HIGH_VOLUME_EVENT:${triggerSide}`).digest("hex").slice(0, 16),
+            isoTimestamp: iso,
+            timestamp: istDisplayTime(iso),
+            underlying,
+            strike,
+            side: triggerSide,
+            type: "HIGH_VOLUME_EVENT",
+            direction: "NEUTRAL",
+            action: "WAIT",
+            spot,
+            eventHigh,
+            eventLow,
+            score: scoreBacktestEvent(maxVolZ, maxVolRatio),
+            reason: `Immediate abnormal SD${lookback} volume event. Wait ${Math.round(trapWaitMs / 60000)} minutes for range-hold confirmation.`,
+            metrics: buildBacktestMetrics(curr, prev, callStats, putStats, watch),
+          });
+        }
+      }
+      prior.push(curr);
+    }
   }
 
-  if (spotChg >= FLOW_ALERT_MIN_SPOT_MOVE && ((putCOI >= FLOW_ALERT_MIN_COI && putPrem < 0) || (callCOI >= FLOW_ALERT_MIN_COI && callPrem > 0))) {
-    const score = 65 + Math.min(20, (Math.max(callCOI, 0) + Math.max(putCOI, 0)) / FLOW_ALERT_MIN_COI * 3) + Math.min(15, absSpotChg);
-    alerts.push(buildFlowAlert({
-      isoTimestamp: curr.isoTimestamp,
-      timestamp: curr.timestamp,
-      strike,
-      timeframe: "1m",
-      type: "BULLISH_CONFIRMATION",
-      direction: "BULLISH",
-      score,
-      spot,
-      title: `Bullish flow confirmation at ${strike}`,
-      message: `Spot rose ${fmtP(spotChg)}. CE premium ${fmtP(callPrem)} with CE COI ${fmtN(callCOI)}, and PE premium ${fmtP(putPrem)} with PE COI ${fmtN(putCOI)}. Upside/reversal is getting confirmation.`,
-      metrics: baseMetrics,
-    }));
-  }
-
-  for (const alert of alerts) await pushFlowAlert(alert);
+  events.sort((a, b) => new Date(a.isoTimestamp).getTime() - new Date(b.isoTimestamp).getTime() || a.strike - b.strike || a.type.localeCompare(b.type));
+  const trades = events.filter((e) => e.action === "BUY_CE" || e.action === "BUY_PE");
+  const wins = trades.filter((e) => e.result === "WIN").length;
+  const losses = trades.filter((e) => e.result === "LOSS").length;
+  const totalPnl = trades.reduce((sum, e) => sum + (e.pnlPoints || 0), 0);
+  return {
+    ok: true,
+    source: fetched.source,
+    params: {
+      underlying,
+      date: dateStr,
+      fromTime,
+      toTime,
+      strike: strikeFilter || null,
+      lookback,
+      minSamples,
+      minVolZscore,
+      minVolRatio,
+      minVolume,
+      trapWaitMinutes: Math.round(trapWaitMs / 60000),
+      breakBuffer,
+      targetPoints,
+      outcomeMinutes,
+    },
+    rowsRead: fetched.rows.length,
+    strikesScanned: grouped.size,
+    summary: {
+      highVolumeEvents: events.filter((e) => e.type === "HIGH_VOLUME_EVENT").length,
+      confirmedTrades: trades.length,
+      buyCe: trades.filter((e) => e.action === "BUY_CE").length,
+      buyPe: trades.filter((e) => e.action === "BUY_PE").length,
+      wins,
+      losses,
+      winRate: trades.length ? Number(((wins / trades.length) * 100).toFixed(2)) : 0,
+      totalPnlPoints: Number(totalPnl.toFixed(2)),
+      avgPnlPoints: trades.length ? Number((totalPnl / trades.length).toFixed(2)) : 0,
+    },
+    events,
+  };
 }
 
 // ── Shared bar-building utilities ────────────────────────────────────────────
@@ -920,8 +1680,15 @@ async function captureAllStrikes(): Promise<void> {
       const prevLive = getLiveHistory(strike)[0];
       const livePoint = buildPoint(sd, prevLive);
       await appendLiveHistory(strike, livePoint);
-      evaluateAndStoreFlowAlerts(strike, livePoint, prevLive)
-        .catch((e: Error) => console.error("[flow-alert] evaluation failed:", e.message));
+
+      // Alert engine uses an underlying-aware store and scans every NIFTY option strike
+      // for immediate SD200 high-volume information alerts.
+      await getFlowAlertHistoryAsync("NIFTY", strike);
+      const prevFlow = getFlowAlertHistory("NIFTY", strike)[0];
+      const flowPoint = buildPoint(sd, prevFlow);
+      await appendFlowAlertHistory("NIFTY", strike, flowPoint);
+      evaluateAndStoreFlowAlerts("NIFTY", strike, flowPoint, prevFlow)
+        .catch((e: Error) => console.error("[flow-alert] NIFTY evaluation failed:", e.message));
     }
 
     lastCaptureSuccessAt = Date.now();
@@ -1223,6 +1990,14 @@ async function captureSensexStrikes(): Promise<void> {
       const prev = getSensexHistory(strike)[0];
       const point = buildPoint(sd, prev, SENSEX_LOT_SIZE);
       await appendSensexHistory(strike, point);
+
+      // Alert engine scans every SENSEX option strike independently from NIFTY.
+      await getFlowAlertHistoryAsync("SENSEX", strike);
+      const prevFlow = getFlowAlertHistory("SENSEX", strike)[0];
+      const flowPoint = buildPoint(sd, prevFlow, SENSEX_LOT_SIZE);
+      await appendFlowAlertHistory("SENSEX", strike, flowPoint);
+      evaluateAndStoreFlowAlerts("SENSEX", strike, flowPoint, prevFlow)
+        .catch((err: Error) => console.error("[flow-alert] SENSEX evaluation failed:", err.message));
     }
   } catch (e: any) {
     console.error(`[sensex-bg] captureSensexStrikes failed: ${extractApiError(e)}`);
@@ -2298,6 +3073,15 @@ async function startServer() {
         minCoi: FLOW_ALERT_MIN_COI,
         minSpotMove: FLOW_ALERT_MIN_SPOT_MOVE,
         maxStrikeDistance: FLOW_ALERT_MAX_STRIKE_DISTANCE,
+        volumeLookback: FLOW_ALERT_VOLUME_LOOKBACK,
+        minVolZscore: FLOW_ALERT_MIN_VOL_ZSCORE,
+        minVolRatio: FLOW_ALERT_MIN_VOL_RATIO,
+        trapWaitMs: FLOW_ALERT_TRAP_WAIT_MS,
+        highVolumeDedupeMs: FLOW_ALERT_HIGH_VOLUME_DEDUPE_MS,
+        scanAllStrikes: FLOW_ALERT_SCAN_ALL_STRIKES,
+        niftyMinVolume: FLOW_ALERT_MIN_VOLUME_NIFTY,
+        sensexMinVolume: FLOW_ALERT_MIN_VOLUME_SENSEX,
+        atmRangeSteps: FLOW_ALERT_ATM_RANGE_STEPS,
         alerts,
       });
     } catch (e: any) {
@@ -2313,6 +3097,27 @@ async function startServer() {
     } catch (e: any) {
       console.error("[flow-alert] ack failed:", e.message);
       res.status(500).json({ ok: false, error: e.message || "failed to acknowledge alert" });
+    }
+  });
+
+
+  app.post("/api/flow-alerts/backtest", async (req, res) => {
+    try {
+      const result = await runFlowTrapBacktest(req.body || {});
+      res.json(result);
+    } catch (e: any) {
+      console.error("[flow-backtest] failed:", e.message);
+      res.status(500).json({ ok: false, error: e.message || "failed to run backtest" });
+    }
+  });
+
+  app.get("/api/flow-alerts/backtest", async (req, res) => {
+    try {
+      const result = await runFlowTrapBacktest(req.query as FlowBacktestRequest);
+      res.json(result);
+    } catch (e: any) {
+      console.error("[flow-backtest] failed:", e.message);
+      res.status(500).json({ ok: false, error: e.message || "failed to run backtest" });
     }
   });
 
