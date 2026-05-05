@@ -8,22 +8,10 @@ type BacktestEvent = {
   underlying: string;
   strike: number;
   side: "CE" | "PE" | "BOTH";
-  triggerStrike?: number;
-  triggerSide?: "CE" | "PE" | "BOTH";
   type: "HIGH_VOLUME_EVENT" | "BEAR_TRAP_BUY_CE" | "BULL_TRAP_BUY_PE";
   direction: "BULLISH" | "BEARISH" | "NEUTRAL";
   action: "WAIT" | "BUY_CE" | "BUY_PE";
   spot: number;
-  entrySpot?: number;
-  tradeStrike?: number;
-  tradeSide?: "CE" | "PE";
-  tradeInstrument?: string;
-  spotSL?: number;
-  optionEntry?: number | null;
-  optionSL?: number | null;
-  optionSLPct?: number;
-  targetPoints?: number;
-  targetSpot?: number;
   eventHigh: number;
   eventLow: number;
   score: number;
@@ -237,13 +225,13 @@ export function BacktestCenter() {
                     <tr className="text-left text-[10px] uppercase tracking-widest text-dark/45">
                       <th className="px-4 py-3">Time</th>
                       <th className="px-4 py-3">Event</th>
-                      <th className="px-4 py-3">Trigger</th>
-                      <th className="px-4 py-3">Trade</th>
-                      <th className="px-4 py-3 text-right">Entry Spot</th>
-                      <th className="px-4 py-3">Trade Strike</th>
-                      <th className="px-4 py-3 text-right">Spot SL</th>
-                      <th className="px-4 py-3 text-right">Option SL</th>
-                      <th className="px-4 py-3 text-right">Target</th>
+                      <th className="px-4 py-3 text-right">Strike</th>
+                      <th className="px-4 py-3">Side</th>
+                      <th className="px-4 py-3">Action</th>
+                      <th className="px-4 py-3 text-right">Spot</th>
+                      <th className="px-4 py-3 text-right">Range</th>
+                      <th className="px-4 py-3 text-right">Vol Z</th>
+                      <th className="px-4 py-3 text-right">Vol/SD</th>
                       <th className="px-4 py-3">Result</th>
                       <th className="px-4 py-3 text-right">Pts</th>
                     </tr>
@@ -256,15 +244,15 @@ export function BacktestCenter() {
                           <div className="font-black text-dark">{typeLabel(e.type)}</div>
                           <div className="text-[11px] text-dark/45 max-w-xs truncate">{e.reason}</div>
                         </td>
-                        <td className="px-4 py-3 font-black whitespace-nowrap">{e.triggerStrike || e.strike} {e.triggerSide || e.side}</td>
+                        <td className="px-4 py-3 text-right font-black">{e.strike}</td>
+                        <td className="px-4 py-3 font-bold">{e.side}</td>
                         <td className="px-4 py-3">
                           <span className={`inline-flex px-2 py-1 rounded-lg text-[11px] font-black ${e.action === "BUY_CE" ? "bg-emerald-100 text-emerald-700" : e.action === "BUY_PE" ? "bg-rose-100 text-rose-700" : "bg-slate-100 text-slate-600"}`}>{e.action}</span>
                         </td>
-                        <td className="px-4 py-3 text-right font-mono">{fmtNum(e.entrySpot ?? e.spot)}</td>
-                        <td className="px-4 py-3 font-black whitespace-nowrap">{e.tradeInstrument || (e.tradeStrike ? String(e.tradeStrike) + " " + (e.tradeSide || "") : "-")}</td>
-                        <td className="px-4 py-3 text-right font-mono">{e.spotSL == null ? "-" : fmtNum(e.spotSL)}</td>
-                        <td className="px-4 py-3 text-right font-mono">{e.optionSL == null ? "-" : fmtNum(e.optionSL)}</td>
-                        <td className="px-4 py-3 text-right font-mono">{e.targetPoints == null ? "-" : fmtNum(e.targetPoints, 1)}</td>
+                        <td className="px-4 py-3 text-right font-mono">{fmtNum(e.spot)}</td>
+                        <td className="px-4 py-3 text-right font-mono text-xs">H {fmtNum(e.eventHigh)} / L {fmtNum(e.eventLow)}</td>
+                        <td className="px-4 py-3 text-right font-mono">{fmtNum(Math.max(e.metrics?.callVolZ || 0, e.metrics?.putVolZ || 0), 2)}</td>
+                        <td className="px-4 py-3 text-right font-mono">{fmtNum(Math.max(e.metrics?.callVolRatio || 0, e.metrics?.putVolRatio || 0), 2)}</td>
                         <td className="px-4 py-3">
                           {e.result ? <span className={`inline-flex px-2 py-1 rounded-lg border text-[11px] font-black ${resultClass(e.result)}`}>{e.result}</span> : <span className="text-dark/30">-</span>}
                         </td>

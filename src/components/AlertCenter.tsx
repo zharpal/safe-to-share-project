@@ -62,18 +62,6 @@ function signed(value: number | undefined, digits = 2): string {
   return `${value > 0 ? "+" : ""}${value.toFixed(digits)}`;
 }
 
-function fmtNum(value: any, digits = 2): string {
-  const n = typeof value === "number" ? value : parseFloat(String(value ?? ""));
-  if (!Number.isFinite(n)) return "-";
-  return n.toLocaleString("en-IN", { maximumFractionDigits: digits, minimumFractionDigits: digits });
-}
-
-function eventLabel(type: string): string {
-  if (type === "HIGH_VOLUME_EVENT") return "High Volume";
-  if (type === "BEAR_TRAP_BUY_CE") return "Bear Trap CE";
-  if (type === "BULL_TRAP_BUY_PE") return "Bull Trap PE";
-  return type.replace(/_/g, " ");
-}
 function formatDateTime(iso: string): string {
   const d = new Date(iso);
   return d.toLocaleString("en-IN", {
@@ -338,56 +326,6 @@ export function AlertCenter() {
         ))}
       </div>
 
-      <div className="bg-white/80 border border-blue/10 rounded-3xl shadow-sm overflow-hidden">
-        <div className="px-5 py-3 border-b border-blue/10 flex items-center justify-between">
-          <h3 className="font-black uppercase tracking-tight text-dark text-sm">Live Alert Plan</h3>
-          <span className="text-[11px] text-dark/45 font-mono">Trigger strike is information; Trade strike is the option to buy after confirmation.</span>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="min-w-full text-sm">
-            <thead className="bg-slate-50 border-b border-blue/10">
-              <tr className="text-left text-[10px] uppercase tracking-widest text-dark/45">
-                <th className="px-4 py-3">Time</th>
-                <th className="px-4 py-3">Event</th>
-                <th className="px-4 py-3">Trigger</th>
-                <th className="px-4 py-3">Trade</th>
-                <th className="px-4 py-3 text-right">Entry Spot</th>
-                <th className="px-4 py-3">Trade Strike</th>
-                <th className="px-4 py-3 text-right">Spot SL</th>
-                <th className="px-4 py-3 text-right">Option SL</th>
-                <th className="px-4 py-3 text-right">Target</th>
-                <th className="px-4 py-3">Result</th>
-                <th className="px-4 py-3 text-right">Pts</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {filteredAlerts.slice(0, 30).map((alert) => {
-                const trigger = alert.metrics.triggerInstrument || `${alert.metrics.triggerStrike || alert.strike} ${alert.metrics.triggerSide || "-"}`;
-                const trade = alert.metrics.tradeAction || (alert.type.includes("BUY_CE") ? "BUY_CE" : alert.type.includes("BUY_PE") ? "BUY_PE" : "WAIT");
-                const tradeStrike = alert.metrics.tradeInstrument || (alert.metrics.tradeStrike ? `${alert.metrics.tradeStrike} ${alert.metrics.tradeSide || ""}` : "-");
-                const resultText = alert.metrics.result || (trade === "WAIT" ? "-" : "LIVE");
-                return (
-                  <tr key={`plan-${alert.id}`} className={trade === "WAIT" ? "bg-white" : "bg-blue/5"}>
-                    <td className="px-4 py-3 font-mono text-xs whitespace-nowrap">{alert.timestamp}</td>
-                    <td className="px-4 py-3 font-black whitespace-nowrap">{eventLabel(alert.type)}</td>
-                    <td className="px-4 py-3 font-black whitespace-nowrap">{trigger}</td>
-                    <td className="px-4 py-3">
-                      <span className={`inline-flex px-2 py-1 rounded-lg text-[11px] font-black ${trade === "BUY_CE" ? "bg-emerald-100 text-emerald-700" : trade === "BUY_PE" ? "bg-rose-100 text-rose-700" : "bg-slate-100 text-slate-600"}`}>{trade}</span>
-                    </td>
-                    <td className="px-4 py-3 text-right font-mono">{fmtNum(alert.metrics.entrySpot ?? alert.spot)}</td>
-                    <td className="px-4 py-3 font-black whitespace-nowrap">{tradeStrike}</td>
-                    <td className="px-4 py-3 text-right font-mono">{fmtNum(alert.metrics.spotSL)}</td>
-                    <td className="px-4 py-3 text-right font-mono">{fmtNum(alert.metrics.optionSL)}</td>
-                    <td className="px-4 py-3 text-right font-mono">{fmtNum(alert.metrics.targetPoints, 1)}</td>
-                    <td className="px-4 py-3 text-xs font-black text-dark/60">{resultText}</td>
-                    <td className={`px-4 py-3 text-right font-mono font-black ${(alert.metrics.pnlPoints || 0) >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{alert.metrics.pnlPoints == null ? "-" : fmtNum(alert.metrics.pnlPoints, 1)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
       <div className="space-y-3">
         {filteredAlerts.length === 0 && (
           <div className="bg-white/70 rounded-3xl border border-blue/10 p-8 text-center text-dark/50">

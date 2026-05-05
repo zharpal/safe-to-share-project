@@ -53,11 +53,6 @@ const FLOW_ALERT_ATM_RANGE_STEPS = parseInt(process.env.FLOW_ALERT_ATM_RANGE_STE
 const FLOW_ALERT_NIFTY_STEP = parseInt(process.env.FLOW_ALERT_NIFTY_STEP || "50", 10);
 const FLOW_ALERT_SENSEX_STEP = parseInt(process.env.FLOW_ALERT_SENSEX_STEP || "100", 10);
 const FLOW_ALERT_BANKNIFTY_STEP = parseInt(process.env.FLOW_ALERT_BANKNIFTY_STEP || "100", 10);
-const FLOW_ALERT_TRADE_STRIKE_OFFSET_STEPS = parseInt(process.env.FLOW_ALERT_TRADE_STRIKE_OFFSET_STEPS || "0", 10);
-const FLOW_ALERT_OPTION_SL_PCT = parseFloat(process.env.FLOW_ALERT_OPTION_SL_PCT || "25");
-const FLOW_ALERT_TARGET_POINTS_NIFTY = parseFloat(process.env.FLOW_ALERT_TARGET_POINTS_NIFTY || "25");
-const FLOW_ALERT_TARGET_POINTS_SENSEX = parseFloat(process.env.FLOW_ALERT_TARGET_POINTS_SENSEX || "80");
-const FLOW_ALERT_TARGET_POINTS_BANKNIFTY = parseFloat(process.env.FLOW_ALERT_TARGET_POINTS_BANKNIFTY || "80");
 const SERVER_SECRETS_FILE = path.join(process.cwd(), "data", "server-secrets.json");
 const APP_SECRETS_TABLE = "app_secrets";
 const ADMIN_SESSION_COOKIE = "admin_session";
@@ -853,81 +848,6 @@ function nearestFlowStrike(underlying: string, spot: number): number {
   return Math.round(spot / step) * step;
 }
 
-function flowAlertTargetPoints(underlying: string): number {
-  const u = normUnderlying(underlying);
-  if (u === "SENSEX") return FLOW_ALERT_TARGET_POINTS_SENSEX;
-  if (u === "BANKNIFTY") return FLOW_ALERT_TARGET_POINTS_BANKNIFTY;
-  return FLOW_ALERT_TARGET_POINTS_NIFTY;
-}
-
-type TradeAction = "BUY_CE" | "BUY_PE";
-
-function tradeSideForAction(action: TradeAction): "CE" | "PE" {
-  return action === "BUY_CE" ? "CE" : "PE";
-}
-
-function tradeStrikeForAction(underlying: string, spot: number, action: TradeAction): number {
-  const step = flowStrikeStep(underlying, spot);
-  const atm = nearestFlowStrike(underlying, spot);
-  const offset = Math.max(0, FLOW_ALERT_TRADE_STRIKE_OFFSET_STEPS);
-  if (action === "BUY_CE") return atm - offset * step;
-  return atm + offset * step;
-}
-
-function spotSlForAction(action: TradeAction, eventHigh: number, eventLow: number, breakBuffer: number): number {
-  return Number((action === "BUY_CE" ? eventLow - breakBuffer : eventHigh + breakBuffer).toFixed(2));
-}
-
-function targetSpotForAction(action: TradeAction, entrySpot: number, targetPoints: number): number {
-  return Number((action === "BUY_CE" ? entrySpot + targetPoints : entrySpot - targetPoints).toFixed(2));
-}
-
-function optionEntryForAction(bar: any, action: TradeAction): number {
-  return action === "BUY_CE" ? num(bar?.call?.ltp) : num(bar?.put?.ltp);
-}
-
-function latestFlowBarAtOrBefore(underlying: string, strike: number, isoTimestamp: string): any | null {
-  const history = getFlowAlertHistory(underlying, strike);
-  const targetMs = new Date(isoTimestamp).getTime();
-  if (!Number.isFinite(targetMs)) return history[0] || null;
-  for (const bar of history) {
-    const ms = new Date(String(bar?.isoTimestamp || "")).getTime();
-    if (Number.isFinite(ms) && ms <= targetMs) return bar;
-  }
-  return history[0] || null;
-}
-
-function buildTradePlanMetrics(
-  underlying: string,
-  action: TradeAction,
-  entrySpot: number,
-  eventHigh: number,
-  eventLow: number,
-  isoTimestamp: string,
-  fallbackBar: any,
-  breakBuffer = FLOW_ALERT_BREAK_BUFFER,
-  targetPoints = flowAlertTargetPoints(underlying),
-): Record<string, any> {
-  const tradeStrike = tradeStrikeForAction(underlying, entrySpot, action);
-  const tradeSide = tradeSideForAction(action);
-  const tradeBar = latestFlowBarAtOrBefore(underlying, tradeStrike, isoTimestamp) || fallbackBar;
-  const entryPremium = optionEntryForAction(tradeBar, action);
-  const optionSL = entryPremium > 0 ? Number((entryPremium * (1 - FLOW_ALERT_OPTION_SL_PCT / 100)).toFixed(2)) : null;
-  return {
-    tradeAction: action,
-    entrySpot: Number(entrySpot.toFixed(2)),
-    tradeStrike,
-    tradeSide,
-    tradeInstrument: String(tradeStrike) + " " + tradeSide,
-    spotSL: spotSlForAction(action, eventHigh, eventLow, breakBuffer),
-    optionEntry: entryPremium || null,
-    optionSL,
-    optionSLPct: FLOW_ALERT_OPTION_SL_PCT,
-    targetPoints,
-    targetSpot: targetSpotForAction(action, entrySpot, targetPoints),
-  };
-}
-
 function isFlowStrikeInScope(underlying: string, strike: number, spot: number): boolean {
   if (FLOW_ALERT_SCAN_ALL_STRIKES) return true;
   const atm = nearestFlowStrike(underlying, spot);
@@ -1001,9 +921,7 @@ function buildTrapBaseMetrics(curr: any, prev: any, callStats: SideVolStats, put
       brokenHigh: watch.brokenHigh,
       brokenLow: watch.brokenLow,
       validationMinutes: Math.round(FLOW_ALERT_TRAP_WAIT_MS / 60000),
-      triggerStrike: watch.strike,
       triggerSide: watch.triggerSide,
-      triggerInstrument: String(watch.strike) + " " + watch.triggerSide,
       trapHint: watch.hint,
       maxVolZ: Number(watch.maxVolZ.toFixed(2)),
       maxVolRatio: Number(watch.maxVolRatio.toFixed(2)),
@@ -1109,7 +1027,6 @@ async function updateTrapWatchAndMaybeAlert(underlying: string, strike: number, 
   let title = "";
   let message = "";
   let score = 0;
-  let tradeAction: TradeAction | null = null;
 
   const bullishScore = 64
     + (watch.brokenLow ? 0 : 14)
@@ -1130,18 +1047,14 @@ async function updateTrapWatchAndMaybeAlert(underlying: string, strike: number, 
   if (preferBullish && bullishFlowOk && bullishScore >= 70) {
     finalDirection = "BULLISH";
     type = "BEAR_TRAP_BUY_CE";
-    tradeAction = "BUY_CE";
-    const plan = buildTradePlanMetrics(normalized, tradeAction, spot, watch.initialHigh, watch.initialLow, curr.isoTimestamp, curr);
-    title = `${normalized} Bear Trap confirmed - ${plan.tradeInstrument} BUY CE`;
-    message = `Trigger: ${watch.strike} ${watch.triggerSide}. Trade: BUY_CE ${plan.tradeInstrument}. Entry spot ${plan.entrySpot}, spot SL ${plan.spotSL}, option SL ${plan.optionSL ?? "premium low / -25%"}, target ${plan.targetPoints} pts. Event low held for 5 minutes and CE flow confirmed.`;
+    title = `${normalized} Bear Trap confirmed - BUY CE watch at ${strike}`;
+    message = `High volume event low held for 5 minutes. Spot did not break below ${fmtP(watch.initialLow)}; CE flow is stronger now. BUY CE is valid while spot holds above event low.`;
     score = bullishScore;
   } else if (preferBearish && bearishFlowOk && bearishScore >= 70) {
     finalDirection = "BEARISH";
     type = "BULL_TRAP_BUY_PE";
-    tradeAction = "BUY_PE";
-    const plan = buildTradePlanMetrics(normalized, tradeAction, spot, watch.initialHigh, watch.initialLow, curr.isoTimestamp, curr);
-    title = `${normalized} Bull Trap confirmed - ${plan.tradeInstrument} BUY PE`;
-    message = `Trigger: ${watch.strike} ${watch.triggerSide}. Trade: BUY_PE ${plan.tradeInstrument}. Entry spot ${plan.entrySpot}, spot SL ${plan.spotSL}, option SL ${plan.optionSL ?? "premium low / -25%"}, target ${plan.targetPoints} pts. Event high held for 5 minutes and PE flow confirmed.`;
+    title = `${normalized} Bull Trap confirmed - BUY PE watch at ${strike}`;
+    message = `High volume event high held for 5 minutes. Spot did not break above ${fmtP(watch.initialHigh)}; PE flow is stronger now. BUY PE is valid while spot stays below event high.`;
     score = bearishScore;
   }
 
@@ -1158,10 +1071,7 @@ async function updateTrapWatchAndMaybeAlert(underlying: string, strike: number, 
       spot,
       title,
       message,
-      metrics: {
-        ...buildTrapBaseMetrics(curr, prev, callStats, putStats, watch),
-        ...(tradeAction ? buildTradePlanMetrics(normalized, tradeAction, spot, watch.initialHigh, watch.initialLow, curr.isoTimestamp, curr) : {}),
-      },
+      metrics: buildTrapBaseMetrics(curr, prev, callStats, putStats, watch),
     }));
   }
 
@@ -1213,22 +1123,10 @@ type FlowBacktestEvent = {
   underlying: string;
   strike: number;
   side: "CE" | "PE" | "BOTH";
-  triggerStrike?: number;
-  triggerSide?: "CE" | "PE" | "BOTH";
   type: "HIGH_VOLUME_EVENT" | "BEAR_TRAP_BUY_CE" | "BULL_TRAP_BUY_PE";
   direction: FlowAlertDirection;
   action: "WAIT" | "BUY_CE" | "BUY_PE";
   spot: number;
-  entrySpot?: number;
-  tradeStrike?: number;
-  tradeSide?: "CE" | "PE";
-  tradeInstrument?: string;
-  spotSL?: number;
-  optionEntry?: number | null;
-  optionSL?: number | null;
-  optionSLPct?: number;
-  targetPoints?: number;
-  targetSpot?: number;
   eventHigh: number;
   eventLow: number;
   score: number;
@@ -1264,7 +1162,10 @@ function istDisplayTime(iso: string): string {
 }
 
 function backtestDefaultTargetPoints(underlying: string): number {
-  return flowAlertTargetPoints(underlying);
+  const u = normUnderlying(underlying);
+  if (u === "SENSEX") return 80;
+  if (u === "BANKNIFTY") return 80;
+  return 25;
 }
 
 function backtestMinVolume(underlying: string, custom?: number): number {
@@ -1323,51 +1224,6 @@ function inferBacktestTrapHint(curr: any, prev: any, callStats: BacktestSideStat
 
 function buildBacktestMetrics(curr: any, prev: any, callStats: BacktestSideStats, putStats: BacktestSideStats, watch?: BacktestWatch | TrapWatch): Record<string, any> {
   return buildTrapBaseMetrics(curr, prev, callStats, putStats, watch as TrapWatch | undefined);
-}
-
-function backtestBarAtOrBefore(grouped: Map<number, any[]>, strike: number, isoTimestamp: string): any | null {
-  const bars = grouped.get(strike) || [];
-  const targetMs = new Date(isoTimestamp).getTime();
-  if (!Number.isFinite(targetMs)) return bars[bars.length - 1] || null;
-  let best: any | null = null;
-  for (const bar of bars) {
-    const ms = new Date(String(bar?.isoTimestamp || "")).getTime();
-    if (!Number.isFinite(ms)) continue;
-    if (ms <= targetMs) best = bar;
-    if (ms > targetMs) break;
-  }
-  return best || null;
-}
-
-function buildBacktestTradePlan(
-  grouped: Map<number, any[]>,
-  underlying: string,
-  action: TradeAction,
-  entrySpot: number,
-  eventHigh: number,
-  eventLow: number,
-  isoTimestamp: string,
-  fallbackBar: any,
-  breakBuffer: number,
-  targetPoints: number,
-): Partial<FlowBacktestEvent> {
-  const tradeStrike = tradeStrikeForAction(underlying, entrySpot, action);
-  const tradeSide = tradeSideForAction(action);
-  const tradeBar = backtestBarAtOrBefore(grouped, tradeStrike, isoTimestamp) || fallbackBar;
-  const entryPremium = optionEntryForAction(tradeBar, action);
-  const optionSL = entryPremium > 0 ? Number((entryPremium * (1 - FLOW_ALERT_OPTION_SL_PCT / 100)).toFixed(2)) : null;
-  return {
-    tradeStrike,
-    tradeSide,
-    tradeInstrument: String(tradeStrike) + " " + tradeSide,
-    entrySpot: Number(entrySpot.toFixed(2)),
-    spotSL: spotSlForAction(action, eventHigh, eventLow, breakBuffer),
-    optionEntry: entryPremium || null,
-    optionSL,
-    optionSLPct: FLOW_ALERT_OPTION_SL_PCT,
-    targetPoints,
-    targetSpot: targetSpotForAction(action, entrySpot, targetPoints),
-  };
 }
 
 async function fetchBacktestRows(underlying: string, seedFromIso: string, endIso: string, strikeFilter?: number): Promise<{ source: string; rows: Array<{ strike: number; bar: any }> }> {
@@ -1550,7 +1406,6 @@ async function runFlowTrapBacktest(input: FlowBacktestRequest) {
           let event: FlowBacktestEvent | null = null;
           if (preferBullish && bullishFlowOk && bullishScore >= 70) {
             const outcome = resolveBacktestOutcome(bars, i, "BUY_CE", spot, watch.initialHigh, watch.initialLow, targetPoints, breakBuffer, outcomeMinutes);
-            const tradePlan = buildBacktestTradePlan(grouped, underlying, "BUY_CE", spot, watch.initialHigh, watch.initialLow, iso, curr, breakBuffer, targetPoints);
             event = {
               id: crypto.createHash("sha1").update(`${iso}:${underlying}:${strike}:BEAR_TRAP_BUY_CE`).digest("hex").slice(0, 16),
               isoTimestamp: iso,
@@ -1558,9 +1413,6 @@ async function runFlowTrapBacktest(input: FlowBacktestRequest) {
               underlying,
               strike,
               side: watch.triggerSide,
-              triggerStrike: strike,
-              triggerSide: watch.triggerSide,
-              ...tradePlan,
               type: "BEAR_TRAP_BUY_CE",
               direction: "BULLISH",
               action: "BUY_CE",
@@ -1569,12 +1421,11 @@ async function runFlowTrapBacktest(input: FlowBacktestRequest) {
               eventLow: watch.initialLow,
               score: clampScore(bullishScore),
               reason: "Event low held for the validation window and CE flow confirmed.",
-              metrics: { ...buildBacktestMetrics(curr, prev, callStats, putStats, watch), ...tradePlan },
+              metrics: buildBacktestMetrics(curr, prev, callStats, putStats, watch),
               ...outcome,
             };
           } else if (preferBearish && bearishFlowOk && bearishScore >= 70) {
             const outcome = resolveBacktestOutcome(bars, i, "BUY_PE", spot, watch.initialHigh, watch.initialLow, targetPoints, breakBuffer, outcomeMinutes);
-            const tradePlan = buildBacktestTradePlan(grouped, underlying, "BUY_PE", spot, watch.initialHigh, watch.initialLow, iso, curr, breakBuffer, targetPoints);
             event = {
               id: crypto.createHash("sha1").update(`${iso}:${underlying}:${strike}:BULL_TRAP_BUY_PE`).digest("hex").slice(0, 16),
               isoTimestamp: iso,
@@ -1582,9 +1433,6 @@ async function runFlowTrapBacktest(input: FlowBacktestRequest) {
               underlying,
               strike,
               side: watch.triggerSide,
-              triggerStrike: strike,
-              triggerSide: watch.triggerSide,
-              ...tradePlan,
               type: "BULL_TRAP_BUY_PE",
               direction: "BEARISH",
               action: "BUY_PE",
@@ -1593,7 +1441,7 @@ async function runFlowTrapBacktest(input: FlowBacktestRequest) {
               eventLow: watch.initialLow,
               score: clampScore(bearishScore),
               reason: "Event high held for the validation window and PE flow confirmed.",
-              metrics: { ...buildBacktestMetrics(curr, prev, callStats, putStats, watch), ...tradePlan },
+              metrics: buildBacktestMetrics(curr, prev, callStats, putStats, watch),
               ...outcome,
             };
           }
@@ -1653,9 +1501,6 @@ async function runFlowTrapBacktest(input: FlowBacktestRequest) {
             underlying,
             strike,
             side: triggerSide,
-            triggerStrike: strike,
-            triggerSide,
-            entrySpot: spot,
             type: "HIGH_VOLUME_EVENT",
             direction: "NEUTRAL",
             action: "WAIT",
@@ -1664,7 +1509,7 @@ async function runFlowTrapBacktest(input: FlowBacktestRequest) {
             eventLow,
             score: scoreBacktestEvent(maxVolZ, maxVolRatio),
             reason: `Immediate abnormal SD${lookback} volume event. Wait ${Math.round(trapWaitMs / 60000)} minutes for range-hold confirmation.`,
-            metrics: { ...buildBacktestMetrics(curr, prev, callStats, putStats, watch), triggerStrike: strike, triggerSide, entrySpot: spot },
+            metrics: buildBacktestMetrics(curr, prev, callStats, putStats, watch),
           });
         }
       }
@@ -3237,11 +3082,6 @@ async function startServer() {
         niftyMinVolume: FLOW_ALERT_MIN_VOLUME_NIFTY,
         sensexMinVolume: FLOW_ALERT_MIN_VOLUME_SENSEX,
         atmRangeSteps: FLOW_ALERT_ATM_RANGE_STEPS,
-        tradeStrikeOffsetSteps: FLOW_ALERT_TRADE_STRIKE_OFFSET_STEPS,
-        optionSlPct: FLOW_ALERT_OPTION_SL_PCT,
-        niftyTargetPoints: FLOW_ALERT_TARGET_POINTS_NIFTY,
-        sensexTargetPoints: FLOW_ALERT_TARGET_POINTS_SENSEX,
-        bankniftyTargetPoints: FLOW_ALERT_TARGET_POINTS_BANKNIFTY,
         alerts,
       });
     } catch (e: any) {
